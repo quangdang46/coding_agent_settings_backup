@@ -2,7 +2,7 @@
 # install.sh — One-liner installer for casb (coding_agent_settings_backup).
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/install.sh | bash
 #   curl -fsSL .../install.sh | CASB_PREFIX=$HOME/.local bash
 #
 # Behaviour:

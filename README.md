@@ -39,7 +39,7 @@ state files.
 ### Linux / macOS (curl | bash)
 
 ```sh
-curl -fsSL "https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/scripts/install.sh?$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/install.sh?$(date +%s)" | bash
 ```
 
 The cache-busting query string forces `curl` to fetch the latest revision.
@@ -55,7 +55,7 @@ Environment knobs:
 ### Windows (PowerShell)
 
 ```powershell
-irm "https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/scripts/install.ps1?$(Get-Date -UFormat %s)" | iex
+irm "https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/install.ps1?$(Get-Date -UFormat %s)" | iex
 ```
 
 Both installers require a Rust toolchain (`cargo`, `rustc`) and `git` on

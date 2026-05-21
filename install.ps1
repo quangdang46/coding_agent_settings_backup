@@ -1,7 +1,7 @@
 # install.ps1 — One-liner installer for casb (coding_agent_settings_backup) on Windows.
 #
 # Usage:
-#   irm "https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/scripts/install.ps1" | iex
+#   irm "https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/install.ps1" | iex
 #
 # Environment knobs:
 #   $env:CASB_REPO    Source repository URL.    Default: https://github.com/quangdang46/coding_agent_settings_backup
