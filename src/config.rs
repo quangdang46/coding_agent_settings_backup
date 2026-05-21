@@ -111,21 +111,42 @@ pub struct CustomAgentConfig {
 }
 
 /// The default exclusion patterns applied to every agent.
+///
+/// Covers common ephemeral or large directories produced by AI coding agents
+/// (logs, sessions, node_modules, temp artifacts) on top of OS-level junk.
 pub fn default_exclusions() -> Vec<String> {
     vec![
-        "*.log".into(),
+        // OS / editor junk
+        ".DS_Store".into(),
+        "Thumbs.db".into(),
+        // Temp / swap files
         "*.tmp".into(),
         "*.temp".into(),
         "*.swp".into(),
         "*~".into(),
-        ".DS_Store".into(),
-        "Thumbs.db".into(),
+        // Logs (often gigabytes in practice, e.g. Codex's codex-tui.log)
+        "*.log".into(),
+        "**/log/**".into(),
+        "**/logs/**".into(),
+        "**/Log/**".into(),
+        // Cache directories
         "**/cache/**".into(),
         "**/Cache/**".into(),
         "**/.cache/**".into(),
+        "**/paste-cache/**".into(),
+        // SQLite WAL / SHM (ephemeral, recreated by SQLite)
         "*.sqlite3-wal".into(),
         "*.sqlite3-shm".into(),
-        "**/paste-cache/**".into(),
+        // Session / replay / timeline data (not configuration)
+        "**/sessions/**".into(),
+        "**/logseq/**".into(),
+        // Node modules (huge, never configuration)
+        "**/node_modules/**".into(),
+        // Agent temp / workdirs
+        "**/tmp/**".into(),
+        "**/temp/**".into(),
+        // Shell snapshots (Codex shell_snapshots)
+        "**/shell_snapshots/**".into(),
     ]
 }
 

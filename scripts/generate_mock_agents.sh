@@ -300,7 +300,7 @@ EOF
 ###############################################################################
 generate_codex() {
     local base="$OUTPUT_DIR/.codex"
-    mkdir -p "$base"/{memories/rollout_summaries,"skills/git-master",shell_snapshots}
+    mkdir -p "$base"/{memories/rollout_summaries,"skills/git-master"}
 
     # ~/.codex/config.toml
     cat > "$base/config.toml" << 'EOF'
@@ -479,8 +479,9 @@ conn.commit()
 conn.close()
 " 2>/dev/null || touch "$base/state_5.sqlite"
 
-    # ~/.codex/shell_snapshots/
-    cat > "$base/shell_snapshots/snapshot-20260520.json" << 'EOF'
+    # ~/.codex/state_backups/
+    mkdir -p "$base/state_backups"
+    cat > "$base/state_backups/snapshot-20260520.json" << 'EOF'
 {
   "timestamp": "2026-05-20T10:30:00Z",
   "cwd": "/data/projects/coding_agent_settings_backup",

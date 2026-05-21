@@ -239,6 +239,11 @@ fn sync_rsync(
     if dry_run {
         args.push("--dry-run".to_string());
     }
+    // Always protect the git metadata directory from --delete; otherwise
+    // rsync will remove .git (it exists only in the destination, not the
+    // source) and subsequent git operations will fail.
+    args.push("--exclude".to_string());
+    args.push(".git".to_string());
     for pat in filter.raw_patterns() {
         args.push("--exclude".to_string());
         args.push(pat.clone());
