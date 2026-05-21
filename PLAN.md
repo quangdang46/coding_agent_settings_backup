@@ -88,18 +88,25 @@ serde_json = "1"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-git2 = "0.19"        # Git operations
 walkdir = "2"        # Directory traversal
 ignore = "0.4"       # .gitignore-style filtering
 tar = "0.4"          # Archive creation
 flate2 = "1"         # gzip compression
 chrono = "0.4"       # Date/time
 dirs = "5"           # Home dir, XDG dirs
-which = "6"          # Find executables (rsync)
-nix = { version = "0.29", features = ["process"] }  # Hook execution
 colored = "2"        # Terminal colors
-serde_toon = "..."   # TOON output (if available)
 ```
+
+### Design Decisions
+
+**No `git2` crate** — Use `std::process::Command` to call `git` CLI directly. Reasons:
+- `git2` requires building `libgit2` (C library) → slow compile, ~2MB larger binary
+- We only need `git add`, `git commit`, `git log`, `git tag`, `git fsck`, `git diff` — all trivial via CLI
+- CLI approach is simpler, more portable, and matches how `asb` already works
+
+**No `nix` crate** — Use `std::process::Command` for hook execution. Reasons:
+- `nix` is Linux/macOS only; `std::process::Command` works on Windows too
+- Hook execution is just running an executable with env vars — `Command` handles this natively
 
 ---
 
@@ -604,9 +611,11 @@ For agents with multiple locations (Claude, OpenCode):
 | **Error handling** | Exit codes only | Structured errors with context |
 | **Parallel backup** | Sequential | ✅ Parallel agent backup |
 | **Doctor command** | ❌ | ✅ Health check |
-| **Binary size** | 4,083 lines bash | ~15-20KB static binary |
-| **Dependencies** | git, rsync (optional) | git2 (bundled libgit2) |
+| **Binary size** | 4,083 lines bash | ~5-8MB static binary (no libgit2) |
+| **Dependencies** | git, rsync (optional) | `git` CLI required (already installed) |
 | **Cross-platform** | Linux/macOS only | Linux/macOS/Windows |
+| **Git operations** | External git calls | `std::process::Command` → git CLI |
+| **Hook execution** | External shell scripts | `std::process::Command` (cross-platform) |
 
 ---
 
@@ -614,9 +623,10 @@ For agents with multiple locations (Claude, OpenCode):
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| `git2` crate compilation | Medium | Bundle libgit2 or use git CLI fallback |
+| `git` CLI not available | Low | Check in `doctor` command, fail early with clear message |
 | rsync not available | Low | cp fallback (same as asb) |
 | Multi-location merge conflicts | Medium | Collision detection + suffix strategy |
 | Large backup sizes | Low | Exclusion filters + git gc |
 | Hook security | Medium | Hooks run as current user, no sudo |
 | Config migration from asb | Low | Import existing `~/.config/asb/config` on first run |
+| `git` version differences | Low | Use stable subcommands, test against git 2.30+ |
