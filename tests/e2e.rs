@@ -5,6 +5,8 @@
 //! scenario exercises a full lifecycle: init → backup → list → history →
 //! diff → tag → restore → export → import → verify → doctor.
 
+#![allow(dead_code, unused_imports)]
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use std::fs;
@@ -28,9 +30,13 @@ impl Env {
         let cfg_dir = home.path().join(".config").join("casb");
         fs::create_dir_all(&cfg_dir).unwrap();
         let config_path = cfg_dir.join("config.toml");
+        // Use forward-slash paths in the TOML so backslashes on Windows
+        // don't get interpreted as Unicode escape sequences by the TOML parser.
+        let backup_root_str = backup_root.display().to_string().replace('\\', "/");
+        let src_str = agent_src.display().to_string().replace('\\', "/");
         let cfg = format!(
             r#"[general]
-backup_root = "{}"
+backup_root = "{backup_root_str}"
 auto_commit = true
 verbose = false
 quiet = false
@@ -48,12 +54,10 @@ interval = "daily"
 [agents.{key}]
 enabled = true
 display_name = "Mock {key}"
-locations = ["{src}"]
+locations = ["{src_str}"]
 exclusions = []
 "#,
-            backup_root.display(),
             key = agent_key,
-            src = agent_src.display(),
         );
         fs::write(&config_path, cfg).unwrap();
         Self {
@@ -76,6 +80,7 @@ exclusions = []
 
 /// Run the bash mock generator into a tempdir and return the populated
 /// directory holding a single agent's mock data.
+#[cfg(unix)]
 fn generate_mock(agent: &str) -> TempDir {
     let dir = TempDir::new().unwrap();
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -95,6 +100,7 @@ fn generate_mock(agent: &str) -> TempDir {
 }
 
 #[test]
+#[cfg(unix)] // requires bash for generate_mock
 fn lifecycle_codex_single_location() {
     let mock = generate_mock("codex");
     let agent_src = mock.path().join(".codex");
@@ -198,6 +204,7 @@ fn lifecycle_codex_single_location() {
 }
 
 #[test]
+#[cfg(unix)] // requires bash for generate_mock
 fn export_import_round_trip() {
     let mock = generate_mock("kiro");
     let agent_src = mock.path().join(".kiro");
@@ -224,6 +231,7 @@ fn export_import_round_trip() {
 }
 
 #[test]
+#[cfg(unix)] // requires bash for generate_mock
 fn doctor_passes_with_minimal_setup() {
     let mock = generate_mock("cursor");
     let agent_src = mock.path().join(".cursor");
@@ -244,6 +252,7 @@ fn doctor_passes_with_minimal_setup() {
 }
 
 #[test]
+#[cfg(unix)] // requires bash for generate_mock
 fn verify_detects_clean_repo() {
     let mock = generate_mock("gemini");
     let env = Env::new("gemini_e2e", &mock.path().join(".gemini"));
@@ -262,6 +271,7 @@ fn verify_detects_clean_repo() {
 }
 
 #[test]
+#[cfg(unix)] // requires bash for generate_mock
 fn dry_run_makes_no_repo() {
     let mock = generate_mock("codex");
     let env = Env::new("codex_dry", &mock.path().join(".codex"));
@@ -315,4 +325,69 @@ fn config_commands_round_trip() {
         .assert()
         .success()
         .stdout(predicates::str::contains("true"));
+}
+
+/// Regression: `casb backup` must exit non-zero when a per-agent backup
+/// fails (e.g. a pre-backup hook returns a non-zero status).
+#[test]
+#[cfg(unix)] // requires bash hook script
+fn backup_exits_non_zero_when_agent_fails() {
+    let src = TempDir::new().unwrap();
+    fs::write(src.path().join("a.txt"), "x").unwrap();
+    let env = Env::new("failagent", src.path());
+
+    // Install a failing pre-backup hook.
+    let hook_dir = env
+        .home
+        .path()
+        .join(".config")
+        .join("casb")
+        .join("pre-backup.d");
+    fs::create_dir_all(&hook_dir).unwrap();
+    let hook_path = hook_dir.join("00-fail.sh");
+    fs::write(&hook_path, "#!/usr/bin/env bash\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_path, perms).unwrap();
+    }
+
+    env.casb().arg("init").assert().success();
+    env.casb()
+        .args(["backup", "failagent"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("✗ failagent"));
+}
+
+/// Regression: round-trip backup → modify source → restore → backup must
+/// not leave a stray `.git` gitlink file in the source location. See
+/// scripts/check_features.sh bug-1 / bug-2.
+#[test]
+#[cfg(unix)] // uses git which may not be configured identically on Windows
+fn restore_does_not_leak_git_gitlink_into_source() {
+    let src = TempDir::new().unwrap();
+    fs::write(src.path().join("a.txt"), "one").unwrap();
+    let env = Env::new("roundtrip", src.path());
+    env.casb().arg("init").assert().success();
+    env.casb()
+        .args(["backup", "roundtrip", "-m", "first"])
+        .assert()
+        .success();
+    fs::write(src.path().join("a.txt"), "two").unwrap();
+    env.casb()
+        .args(["--force", "restore", "roundtrip"])
+        .assert()
+        .success();
+    assert!(
+        !src.path().join(".git").exists(),
+        "restore must not leave a .git gitlink in the source location"
+    );
+    // And a subsequent backup must still succeed cleanly.
+    env.casb()
+        .args(["backup", "roundtrip", "-m", "second"])
+        .assert()
+        .success();
 }

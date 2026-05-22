@@ -142,7 +142,15 @@ fn cmd_backup(
             p.text_line(&backup::format_outcome_text(o))?;
         }
     }
-    emit_data(p, "backup", &outcomes)
+    // Surface per-agent errors as a non-zero exit so CI / systemd timers /
+    // hook chains can detect them. The per-agent error messages have already
+    // been printed above; the envelope still carries the full outcome list.
+    let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
+    emit_data(p, "backup", &outcomes)?;
+    if failed > 0 {
+        return Err(CasbError::BackupFailed { count: failed });
+    }
+    Ok(())
 }
 
 // ----- restore -----
