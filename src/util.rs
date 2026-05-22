@@ -18,7 +18,7 @@ pub fn expand_tilde(path: impl AsRef<Path>) -> PathBuf {
         Some(s) => s,
         None => return p.to_path_buf(),
     };
-    if let Some(rest) = s.strip_prefix("~/") {
+    if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest);
         }
@@ -115,12 +115,26 @@ pub fn run_check<S: AsRef<OsStr>>(program: S, args: &[&str]) -> Result<String> {
 }
 
 /// Check whether an executable is available on `$PATH`.
+///
+/// On Windows the bare name is checked first, then common executable
+/// extensions (`.exe`, `.cmd`, `.bat`, `.com`) are appended because
+/// the Windows shell resolves commands via `PATHEXT` but
+/// `Path::is_file()` does not.
 pub fn which(program: &str) -> bool {
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join(program);
             if candidate.is_file() {
                 return true;
+            }
+            #[cfg(windows)]
+            {
+                for ext in &[".exe", ".cmd", ".bat", ".com"] {
+                    let with_ext = dir.join(format!("{program}{ext}"));
+                    if with_ext.is_file() {
+                        return true;
+                    }
+                }
             }
         }
     }

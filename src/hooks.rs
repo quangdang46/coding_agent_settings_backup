@@ -113,7 +113,7 @@ pub fn run_hooks(kind: HookKind, agent_key: &str) -> Result<()> {
         if !is_executable(&path) {
             continue;
         }
-        let mut cmd = Command::new(&path);
+        let mut cmd = build_hook_command(&path);
         cmd.arg(agent_key)
             .env("CASB_HOOK", kind.dir_name())
             .env("CASB_AGENT", agent_key);
@@ -128,6 +128,40 @@ pub fn run_hooks(kind: HookKind, agent_key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Build the appropriate `Command` for the hook script's extension.
+///
+/// On Windows `.ps1` scripts are invoked via `powershell -ExecutionPolicy Bypass -File`,
+/// `.cmd`/`.bat` via `cmd.exe /C`, and everything else directly.
+#[cfg(windows)]
+fn build_hook_command(path: &std::path::Path) -> Command {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "ps1" => {
+            let mut cmd = Command::new("powershell");
+            cmd.arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-File")
+                .arg(path);
+            cmd
+        }
+        "cmd" | "bat" => {
+            let mut cmd = Command::new("cmd.exe");
+            cmd.arg("/C").arg(path);
+            cmd
+        }
+        _ => Command::new(path),
+    }
+}
+
+#[cfg(not(windows))]
+fn build_hook_command(path: &std::path::Path) -> Command {
+    Command::new(path)
+}
+
 #[cfg(unix)]
 fn is_executable(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -137,8 +171,15 @@ fn is_executable(path: &std::path::Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable(_path: &std::path::Path) -> bool {
-    true
+fn is_executable(path: &std::path::Path) -> bool {
+    // On Windows, any file with a recognised executable extension is runnable.
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "exe" | "cmd" | "bat" | "ps1" | "com"
+        ),
+        None => false,
+    }
 }
 
 #[cfg(test)]

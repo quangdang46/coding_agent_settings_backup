@@ -499,14 +499,18 @@ fn cmd_schedule(p: &mut Printer, action: ScheduleAction) -> Result<()> {
             emit_data(p, "schedule-status", &s)
         }
         ScheduleAction::Install { interval, method } => {
-            let m = schedule::Method::parse(&method)?;
+            let m = match method {
+                Some(ref s) => schedule::Method::parse(s)?,
+                None => schedule::Method::platform_default(),
+            };
             let i = schedule::Interval::parse(&interval)?;
             schedule::install(m, i)?;
-            p.text_line(&format!("installed {method} schedule ({interval})"))?;
+            let method_label = format!("{m:?}").to_lowercase();
+            p.text_line(&format!("installed {method_label} schedule ({interval})"))?;
             emit_data(
                 p,
                 "schedule-install",
-                serde_json::json!({"method": method, "interval": interval}),
+                serde_json::json!({"method": method_label, "interval": interval}),
             )
         }
         ScheduleAction::Remove => {

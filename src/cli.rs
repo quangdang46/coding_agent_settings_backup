@@ -232,9 +232,10 @@ pub enum ScheduleAction {
         /// Schedule interval (`hourly` | `daily` | `weekly`).
         #[arg(default_value = "daily")]
         interval: String,
-        /// Backend (`systemd` | `cron`).
-        #[arg(long, default_value = "systemd")]
-        method: String,
+        /// Backend (`systemd` | `cron` | `taskscheduler`).
+        /// Auto-detected if not specified.
+        #[arg(long)]
+        method: Option<String>,
     },
     /// Remove the active schedule.
     Remove,
