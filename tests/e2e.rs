@@ -71,6 +71,9 @@ exclusions = []
     fn casb(&self) -> Command {
         let mut cmd = Command::cargo_bin("casb").unwrap();
         cmd.env("HOME", self.home.path());
+        // On Windows the `dirs` crate reads USERPROFILE.
+        #[cfg(windows)]
+        cmd.env("USERPROFILE", self.home.path());
         cmd.env("CASB_CONFIG", &self.config_path);
         cmd.env_remove("XDG_CONFIG_HOME");
         cmd.env_remove("XDG_DATA_HOME");
@@ -96,6 +99,33 @@ fn generate_mock(agent: &str) -> TempDir {
         .status()
         .expect("run mock generator");
     assert!(status.success(), "mock generator failed");
+    dir
+}
+
+/// Generate minimal mock agent data without requiring bash.
+fn generate_mock_portable(agent: &str) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let agent_dir = dir.path().join(format!(".{agent}"));
+    fs::create_dir_all(&agent_dir).unwrap();
+    let config_name = match agent {
+        "claude" | "codex" | "gemini" | "cursor" => "config.toml",
+        _ => "settings.json",
+    };
+    let config_content = match agent {
+        "codex" => "# Codex CLI Configuration\nmodel = \"codex-mini\"\n".to_string(),
+        "claude" => "# Claude Code Configuration\nmodel = \"claude-4\"\n".to_string(),
+        _ => format!("# {agent} Configuration\nenabled = true\n"),
+    };
+    fs::write(agent_dir.join(config_name), &config_content).unwrap();
+    fs::write(
+        agent_dir.join("state.json"),
+        format!("{{\"agent\": \"{agent}\", \"version\": 1}}"),
+    )
+    .unwrap();
+    // Add a nested directory.
+    let sub = agent_dir.join("cache");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("data.bin"), "cached-data").unwrap();
     dir
 }
 
@@ -289,7 +319,8 @@ fn dry_run_makes_no_repo() {
 
 #[test]
 fn version_and_help_succeed() {
-    let env = Env::new("noop", Path::new("/tmp"));
+    let dummy = TempDir::new().unwrap();
+    let env = Env::new("noop", dummy.path());
     env.casb()
         .arg("version")
         .assert()
@@ -304,7 +335,8 @@ fn version_and_help_succeed() {
 
 #[test]
 fn completion_generates_bash() {
-    let env = Env::new("noop", Path::new("/tmp"));
+    let dummy = TempDir::new().unwrap();
+    let env = Env::new("noop", dummy.path());
     env.casb()
         .args(["completion", "bash"])
         .assert()
@@ -314,7 +346,8 @@ fn completion_generates_bash() {
 
 #[test]
 fn config_commands_round_trip() {
-    let env = Env::new("noop", Path::new("/tmp"));
+    let dummy = TempDir::new().unwrap();
+    let env = Env::new("noop", dummy.path());
     env.casb().args(["config", "init"]).assert().success();
     env.casb()
         .args(["config", "set", "general.verbose", "true"])
@@ -390,4 +423,114 @@ fn restore_does_not_leak_git_gitlink_into_source() {
         .args(["backup", "roundtrip", "-m", "second"])
         .assert()
         .success();
+}
+
+// ---- Cross-platform tests using portable mock generator ----
+
+#[test]
+fn portable_lifecycle_backup_and_restore() {
+    let mock = generate_mock_portable("codex");
+    let agent_src = mock.path().join(".codex");
+    let env = Env::new("codex_p", &agent_src);
+
+    env.casb().arg("init").assert().success();
+    env.casb()
+        .args(["list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("codex_p"));
+
+    env.casb()
+        .args(["backup", "codex_p"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("codex_p"));
+
+    let repo = env.backup_root.join(".codex_p");
+    assert!(repo.join(".git").exists(), "repo must be initialised");
+
+    env.casb()
+        .args(["history", "codex_p"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("codex_p"));
+
+    // A second backup after no source changes ensures the repo is in
+    // sync, avoiding false diffs caused by git line-ending normalisation
+    // on Windows during the initial commit.
+    env.casb().args(["backup", "codex_p"]).assert().success();
+
+    // Modify source and verify diff detects it.
+    fs::write(agent_src.join("config.toml"), "modified=true\n").unwrap();
+    env.casb()
+        .args(["diff", "codex_p"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("modified"));
+
+    // Tag, verify, stats.
+    env.casb()
+        .args(["tag", "create", "codex_p", "v1", "-m", "first tag"])
+        .assert()
+        .success();
+    env.casb()
+        .args(["tag", "list", "codex_p"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("v1"));
+
+    env.casb()
+        .args(["verify", "codex_p"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("clean"));
+
+    env.casb()
+        .args(["stats", "codex_p"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("codex_p"));
+
+    // Restore with --force.
+    env.casb()
+        .args(["restore", "codex_p", "--force"])
+        .assert()
+        .success();
+    let restored = fs::read_to_string(agent_src.join("config.toml")).unwrap();
+    assert!(
+        restored.contains("Codex CLI Configuration"),
+        "expected original mock content, got: {restored}"
+    );
+
+    // JSON output round-trip.
+    let assert = env.casb().args(["--json", "list"]).assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(json["ok"], serde_json::Value::Bool(true));
+}
+
+#[test]
+fn portable_export_import_round_trip() {
+    let mock = generate_mock_portable("kiro");
+    let agent_src = mock.path().join(".kiro");
+    let env = Env::new("kiro_p", &agent_src);
+
+    env.casb().arg("init").assert().success();
+    env.casb().arg("backup").arg("kiro_p").assert().success();
+
+    let archive_dir = TempDir::new().unwrap();
+    let archive = archive_dir.path().join("kiro.tar.gz");
+    env.casb()
+        .args(["export", "kiro_p"])
+        .arg(&archive)
+        .assert()
+        .success();
+    assert!(archive.exists(), "archive must be created");
+
+    // Import into a fresh env.
+    let mock2 = generate_mock_portable("kiro");
+    let agent_src2 = mock2.path().join(".kiro");
+    let env2 = Env::new("kiro_p", &agent_src2);
+    env2.casb().arg("import").arg(&archive).assert().success();
+    assert!(env2.backup_root.join(".kiro_p").join(".git").exists());
 }

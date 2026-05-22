@@ -222,7 +222,14 @@ fn disk_space_detail(path: &Path) -> Option<String> {
     if !path.exists() {
         return None;
     }
-    // Best-effort: invoke `df -h` for the path.
+    if cfg!(windows) {
+        disk_space_windows(path)
+    } else {
+        disk_space_unix(path)
+    }
+}
+
+fn disk_space_unix(path: &Path) -> Option<String> {
     let out = std::process::Command::new("df")
         .arg("-h")
         .arg(path)
@@ -236,4 +243,28 @@ fn disk_space_detail(path: &Path) -> Option<String> {
     iter.next()?; // header
     let line = iter.next()?;
     Some(line.trim().to_string())
+}
+
+fn disk_space_windows(path: &Path) -> Option<String> {
+    let drive = path.to_str()?.chars().next()?.to_ascii_uppercase();
+    let script = format!(
+        "$d = Get-PSDrive -Name '{}' -ErrorAction SilentlyContinue; \
+         if ($d) {{ '{{}}: {{0:N1}} GB free / {{1:N1}} GB total' -f $d.Name, \
+         ($d.Free / 1GB), (($d.Used + $d.Free) / 1GB) }}",
+        drive
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.to_string())
+    }
 }

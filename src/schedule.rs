@@ -17,6 +17,8 @@ pub enum Method {
     Systemd,
     /// cron line.
     Cron,
+    /// Windows Task Scheduler.
+    TaskScheduler,
 }
 
 impl Method {
@@ -25,9 +27,21 @@ impl Method {
         match s.trim().to_ascii_lowercase().as_str() {
             "systemd" => Ok(Self::Systemd),
             "cron" => Ok(Self::Cron),
+            "taskscheduler" | "schtasks" => Ok(Self::TaskScheduler),
             other => Err(CasbError::InvalidArgument(format!(
                 "unknown schedule method: {other}"
             ))),
+        }
+    }
+
+    /// Return the best method for the current platform.
+    pub fn platform_default() -> Self {
+        if cfg!(windows) {
+            Self::TaskScheduler
+        } else if which("systemctl") {
+            Self::Systemd
+        } else {
+            Self::Cron
         }
     }
 }
@@ -94,6 +108,7 @@ pub fn install(method: Method, interval: Interval) -> Result<()> {
     match method {
         Method::Systemd => install_systemd(interval),
         Method::Cron => install_cron(interval),
+        Method::TaskScheduler => install_task_scheduler(interval),
     }
 }
 
@@ -101,6 +116,7 @@ pub fn install(method: Method, interval: Interval) -> Result<()> {
 pub fn remove() -> Result<()> {
     let _ = remove_systemd();
     let _ = remove_cron();
+    let _ = remove_task_scheduler();
     Ok(())
 }
 
@@ -118,6 +134,13 @@ pub fn status() -> Result<ScheduleStatus> {
             installed: true,
             method: Some(Method::Cron),
             trigger: Some(line),
+        });
+    }
+    if let Some(trigger) = task_scheduler_trigger()? {
+        return Ok(ScheduleStatus {
+            installed: true,
+            method: Some(Method::TaskScheduler),
+            trigger: Some(trigger),
         });
     }
     Ok(ScheduleStatus {
@@ -277,6 +300,76 @@ fn write_crontab(content: &str) -> Result<()> {
     Ok(())
 }
 
+// ---- Windows Task Scheduler ----
+
+const SCHTASKS_NAME: &str = "casb-backup";
+
+fn install_task_scheduler(interval: Interval) -> Result<()> {
+    if !which("schtasks") {
+        return Err(CasbError::other(
+            "schtasks not found; Task Scheduler not available",
+        ));
+    }
+    let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("casb"));
+    let (schedule, modifier) = match interval {
+        Interval::Hourly => ("HOURLY", "1"),
+        Interval::Daily => ("DAILY", "1"),
+        Interval::Weekly => ("WEEKLY", "1"),
+    };
+    // Remove existing task first (best-effort).
+    let _ = remove_task_scheduler();
+    let out = run_capture(
+        "schtasks",
+        &[
+            "/Create",
+            "/TN",
+            SCHTASKS_NAME,
+            "/TR",
+            &format!("\"{}\" backup", bin.display()),
+            "/SC",
+            schedule,
+            "/MO",
+            modifier,
+            "/ST",
+            "02:00",
+            "/F",
+        ],
+    )?;
+    if !out.status.success() {
+        return Err(CasbError::CommandFailed {
+            command: "schtasks /Create".into(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn remove_task_scheduler() -> Result<()> {
+    if !which("schtasks") {
+        return Ok(());
+    }
+    let _ = run_capture("schtasks", &["/Delete", "/TN", SCHTASKS_NAME, "/F"]);
+    Ok(())
+}
+
+fn task_scheduler_trigger() -> Result<Option<String>> {
+    if !which("schtasks") {
+        return Ok(None);
+    }
+    let out = run_capture("schtasks", &["/Query", "/TN", SCHTASKS_NAME, "/FO", "LIST"])?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Schedule Type:") {
+            return Ok(Some(rest.trim().to_string()));
+        }
+    }
+    Ok(Some("installed".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +378,11 @@ mod tests {
     fn parse_method_variants() {
         assert_eq!(Method::parse("systemd").unwrap(), Method::Systemd);
         assert_eq!(Method::parse("CRON").unwrap(), Method::Cron);
+        assert_eq!(
+            Method::parse("taskscheduler").unwrap(),
+            Method::TaskScheduler
+        );
+        assert_eq!(Method::parse("schtasks").unwrap(), Method::TaskScheduler);
         assert!(Method::parse("nonsense").is_err());
     }
 

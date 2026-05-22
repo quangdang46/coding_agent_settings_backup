@@ -81,8 +81,18 @@ impl ExclusionFilter {
     /// against the file/component basename (gitignore-style). Patterns
     /// containing `**` are matched with `MatchOptions::default()`, which
     /// honours `**` only at separator boundaries.
+    ///
+    /// On Windows the path is normalised to forward slashes before
+    /// matching so that Unix-style glob patterns (`**/cache/**`) work
+    /// regardless of the native separator.
     pub fn is_excluded(&self, rel_path: &Path) -> bool {
-        let path_str = rel_path.to_string_lossy();
+        let raw = rel_path.to_string_lossy();
+        // Normalise to forward slashes for consistent glob matching.
+        let path_str: std::borrow::Cow<'_, str> = if cfg!(windows) {
+            std::borrow::Cow::Owned(raw.replace('\\', "/"))
+        } else {
+            raw
+        };
         let basename = rel_path
             .file_name()
             .map(|s| s.to_string_lossy())
