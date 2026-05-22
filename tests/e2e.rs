@@ -28,9 +28,13 @@ impl Env {
         let cfg_dir = home.path().join(".config").join("casb");
         fs::create_dir_all(&cfg_dir).unwrap();
         let config_path = cfg_dir.join("config.toml");
+        // Use forward-slash paths in the TOML so backslashes on Windows
+        // don't get interpreted as Unicode escape sequences by the TOML parser.
+        let backup_root_str = backup_root.display().to_string().replace('\\', "/");
+        let src_str = agent_src.display().to_string().replace('\\', "/");
         let cfg = format!(
             r#"[general]
-backup_root = "{}"
+backup_root = "{backup_root_str}"
 auto_commit = true
 verbose = false
 quiet = false
@@ -48,12 +52,10 @@ interval = "daily"
 [agents.{key}]
 enabled = true
 display_name = "Mock {key}"
-locations = ["{src}"]
+locations = ["{src_str}"]
 exclusions = []
 "#,
-            backup_root.display(),
             key = agent_key,
-            src = agent_src.display(),
         );
         fs::write(&config_path, cfg).unwrap();
         Self {
@@ -76,6 +78,7 @@ exclusions = []
 
 /// Run the bash mock generator into a tempdir and return the populated
 /// directory holding a single agent's mock data.
+#[cfg(unix)]
 fn generate_mock(agent: &str) -> TempDir {
     let dir = TempDir::new().unwrap();
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -95,6 +98,7 @@ fn generate_mock(agent: &str) -> TempDir {
 }
 
 #[test]
+#[cfg(unix)] // requires bash for generate_mock
 fn lifecycle_codex_single_location() {
     let mock = generate_mock("codex");
     let agent_src = mock.path().join(".codex");
@@ -198,6 +202,7 @@ fn lifecycle_codex_single_location() {
 }
 
 #[test]
+#[cfg(unix)] // requires bash for generate_mock
 fn export_import_round_trip() {
     let mock = generate_mock("kiro");
     let agent_src = mock.path().join(".kiro");
@@ -224,6 +229,7 @@ fn export_import_round_trip() {
 }
 
 #[test]
+#[cfg(unix)] // requires bash for generate_mock
 fn doctor_passes_with_minimal_setup() {
     let mock = generate_mock("cursor");
     let agent_src = mock.path().join(".cursor");
@@ -244,6 +250,7 @@ fn doctor_passes_with_minimal_setup() {
 }
 
 #[test]
+#[cfg(unix)] // requires bash for generate_mock
 fn verify_detects_clean_repo() {
     let mock = generate_mock("gemini");
     let env = Env::new("gemini_e2e", &mock.path().join(".gemini"));
@@ -262,6 +269,7 @@ fn verify_detects_clean_repo() {
 }
 
 #[test]
+#[cfg(unix)] // requires bash for generate_mock
 fn dry_run_makes_no_repo() {
     let mock = generate_mock("codex");
     let env = Env::new("codex_dry", &mock.path().join(".codex"));
@@ -320,6 +328,7 @@ fn config_commands_round_trip() {
 /// Regression: `casb backup` must exit non-zero when a per-agent backup
 /// fails (e.g. a pre-backup hook returns a non-zero status).
 #[test]
+#[cfg(unix)] // requires bash hook script
 fn backup_exits_non_zero_when_agent_fails() {
     let src = TempDir::new().unwrap();
     fs::write(src.path().join("a.txt"), "x").unwrap();
@@ -355,6 +364,7 @@ fn backup_exits_non_zero_when_agent_fails() {
 /// not leave a stray `.git` gitlink file in the source location. See
 /// scripts/check_features.sh bug-1 / bug-2.
 #[test]
+#[cfg(unix)] // uses git which may not be configured identically on Windows
 fn restore_does_not_leak_git_gitlink_into_source() {
     let src = TempDir::new().unwrap();
     fs::write(src.path().join("a.txt"), "one").unwrap();
