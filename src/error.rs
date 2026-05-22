@@ -88,6 +88,13 @@ pub enum CasbError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// One or more per-agent backups reported an error.
+    #[error("{count} agent(s) failed to back up")]
+    BackupFailed {
+        /// Number of agents that errored.
+        count: usize,
+    },
+
     /// Catch-all for descriptive errors.
     #[error("{0}")]
     Other(String),

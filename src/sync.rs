@@ -62,8 +62,23 @@ pub fn sync_agent_to_backup(
 
     for loc in agent.installed_locations() {
         let dest = backup_dest_for(dest_root, loc);
-        if !dest.exists() && !dry_run {
-            std::fs::create_dir_all(&dest)?;
+        if !dry_run {
+            // For File-kind locations, `dest` is the final file path -- we
+            // must only ensure the parent directory exists, NOT create the
+            // file itself as a directory (which would later fail with
+            // EISDIR inside sync_file).
+            match loc.kind {
+                LocationKind::Directory => {
+                    if !dest.exists() {
+                        std::fs::create_dir_all(&dest)?;
+                    }
+                }
+                LocationKind::File => {
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                }
+            }
         }
         let stats = sync_location(loc, &dest, filter, use_rsync, dry_run)?;
         total.merge(&stats);
@@ -292,6 +307,14 @@ fn sync_walkdir(
     for entry in walkdir::WalkDir::new(src)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|e| {
+            // Never traverse into a `.git` directory or copy a `.git` file
+            // from the source. The destination owns the only legitimate
+            // `.git` (the backup repo metadata); pulling one in from the
+            // source produces gitlinks/EISDIR errors on the next backup.
+            // Mirrors the `--exclude .git` we already pass to rsync.
+            e.path() == src || e.file_name() != ".git"
+        })
         .filter_map(|e| e.ok())
     {
         let rel = match entry.path().strip_prefix(src) {
@@ -432,5 +455,60 @@ mod tests {
         sync_agent_to_backup(&agent, dest.path(), &filter, false, false).unwrap();
         assert!(dest.path().join("home/home.txt").exists());
         assert!(dest.path().join("data/data.txt").exists());
+    }
+
+    /// Regression: a [`LocationKind::File`] backed up under a `backup_subdir`
+    /// must land at `<subdir>/<basename>` as a FILE, not a directory.
+    /// See bug-4 in scripts/check_features.sh.
+    #[test]
+    fn file_kind_location_backs_up_as_file() {
+        let src = tempdir().unwrap();
+        let dest = tempdir().unwrap();
+        let file_src = src.path().join(".claude.json");
+        std::fs::write(&file_src, "{}").unwrap();
+
+        let agent = AgentConfig {
+            key: "claude".into(),
+            display_name: "Claude".into(),
+            category: crate::agent::AgentCategory::CliCoding,
+            locations: vec![AgentLocation {
+                path: file_src,
+                location_type: LocationType::HomeDir,
+                kind: LocationKind::File,
+                backup_subdir: "root".into(),
+            }],
+        };
+        let filter = ExclusionFilter::new(vec![]).unwrap();
+        sync_agent_to_backup(&agent, dest.path(), &filter, false, false).unwrap();
+
+        let copied = dest.path().join("root/.claude.json");
+        assert!(copied.is_file(), "{copied:?} must be a file, not a dir");
+        assert_eq!(std::fs::read_to_string(&copied).unwrap(), "{}");
+    }
+
+    /// Regression: a `.git` file or directory in the source must never be
+    /// copied into the backup repo; only the destination's own `.git`
+    /// (the backup repo metadata) is legitimate. See bug-1 / bug-2.
+    #[test]
+    fn walkdir_skips_dot_git_in_source() {
+        let src = tempdir().unwrap();
+        let dest = tempdir().unwrap();
+        // Simulate a stray gitlink file left over by a previous restore.
+        std::fs::write(src.path().join(".git"), "gitdir: /nonexistent\n").unwrap();
+        std::fs::write(src.path().join("real.txt"), "keep").unwrap();
+        // Pre-existing destination .git directory (mimics the backup repo).
+        std::fs::create_dir_all(dest.path().join(".git/objects")).unwrap();
+        std::fs::write(dest.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+
+        let filter = ExclusionFilter::new(vec![]).unwrap();
+        sync_walkdir(src.path(), dest.path(), &filter, false).unwrap();
+
+        // The destination's own .git must be intact.
+        assert!(dest.path().join(".git/HEAD").exists());
+        // The source's .git must NOT have clobbered it.
+        let head_contents = std::fs::read_to_string(dest.path().join(".git/HEAD")).unwrap();
+        assert_eq!(head_contents, "ref: refs/heads/main");
+        // Real files still get through.
+        assert!(dest.path().join("real.txt").exists());
     }
 }

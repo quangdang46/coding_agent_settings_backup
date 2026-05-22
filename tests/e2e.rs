@@ -316,3 +316,66 @@ fn config_commands_round_trip() {
         .success()
         .stdout(predicates::str::contains("true"));
 }
+
+/// Regression: `casb backup` must exit non-zero when a per-agent backup
+/// fails (e.g. a pre-backup hook returns a non-zero status).
+#[test]
+fn backup_exits_non_zero_when_agent_fails() {
+    let src = TempDir::new().unwrap();
+    fs::write(src.path().join("a.txt"), "x").unwrap();
+    let env = Env::new("failagent", src.path());
+
+    // Install a failing pre-backup hook.
+    let hook_dir = env
+        .home
+        .path()
+        .join(".config")
+        .join("casb")
+        .join("pre-backup.d");
+    fs::create_dir_all(&hook_dir).unwrap();
+    let hook_path = hook_dir.join("00-fail.sh");
+    fs::write(&hook_path, "#!/usr/bin/env bash\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_path, perms).unwrap();
+    }
+
+    env.casb().arg("init").assert().success();
+    env.casb()
+        .args(["backup", "failagent"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("✗ failagent"));
+}
+
+/// Regression: round-trip backup → modify source → restore → backup must
+/// not leave a stray `.git` gitlink file in the source location. See
+/// scripts/check_features.sh bug-1 / bug-2.
+#[test]
+fn restore_does_not_leak_git_gitlink_into_source() {
+    let src = TempDir::new().unwrap();
+    fs::write(src.path().join("a.txt"), "one").unwrap();
+    let env = Env::new("roundtrip", src.path());
+    env.casb().arg("init").assert().success();
+    env.casb()
+        .args(["backup", "roundtrip", "-m", "first"])
+        .assert()
+        .success();
+    fs::write(src.path().join("a.txt"), "two").unwrap();
+    env.casb()
+        .args(["--force", "restore", "roundtrip"])
+        .assert()
+        .success();
+    assert!(
+        !src.path().join(".git").exists(),
+        "restore must not leave a .git gitlink in the source location"
+    );
+    // And a subsequent backup must still succeed cleanly.
+    env.casb()
+        .args(["backup", "roundtrip", "-m", "second"])
+        .assert()
+        .success();
+}
