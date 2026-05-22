@@ -5,6 +5,8 @@
 //! scenario exercises a full lifecycle: init → backup → list → history →
 //! diff → tag → restore → export → import → verify → doctor.
 
+#![allow(dead_code, unused_imports)]
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use std::fs;
