@@ -63,14 +63,21 @@
     # ── Verify SHA-256 if checksum file is available ─────────────────────
     $sha256Url = "$downloadUrl.sha256"
     try {
-        $expectedHash = (Invoke-WebRequest -Uri $sha256Url -UseBasicParsing).Content.Trim().Split(' ')[0]
+        $resp = Invoke-WebRequest -Uri $sha256Url -UseBasicParsing
+        # .Content may be a byte array or a string depending on PS version.
+        $raw = if ($resp.Content -is [byte[]]) {
+            [System.Text.Encoding]::UTF8.GetString($resp.Content)
+        } else {
+            $resp.Content
+        }
+        $expectedHash = $raw.Trim().Split(' ')[0].ToLower()
         $actualHash   = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
         if ($actualHash -ne $expectedHash) {
             Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
             Fail "SHA-256 mismatch: expected $expectedHash, got $actualHash"
         }
         Write-Step 'SHA-256 checksum verified'
-    } catch [System.Net.WebException] {
+    } catch {
         Write-Warn 'SHA-256 checksum file not available — skipping verification'
     }
 
