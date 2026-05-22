@@ -173,6 +173,9 @@ mod tests {
 
     #[test]
     fn which_finds_sh() {
+        // `sh` is only guaranteed to exist on Unix; skip the positive
+        // assertion on Windows where it's absent from PATH.
+        #[cfg(unix)]
         assert!(which("sh"));
         assert!(!which("definitely-not-a-real-program-xyzzy"));
     }
