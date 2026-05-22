@@ -4,14 +4,17 @@
 #   irm "https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/install.ps1" | iex
 #
 # Environment knobs:
-#   $env:CASB_REPO    Source repository URL.    Default: https://github.com/quangdang46/coding_agent_settings_backup
-#   $env:CASB_REF     Git ref to install from.  Default: main
-#   $env:CASB_PREFIX  Cargo install root.       Default: $env:USERPROFILE\.cargo
+#   $env:CASB_VERSION  Specific version tag (e.g. "v0.1.0").  Default: latest release
+#   $env:CASB_PREFIX   Install directory for casb.exe.        Default: $env:USERPROFILE\.casb\bin
 #
-# Requires `cargo` (Rust toolchain) and `git` on PATH.
+# Downloads the pre-built binary from GitHub Releases — no Rust toolchain
+# required.  Only needs PowerShell 5+ and internet access.
 
 & {
     $ErrorActionPreference = 'Stop'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    $GH_REPO = 'quangdang46/coding_agent_settings_backup'
 
     function Write-Step([string]$Message) {
         Write-Host "==> $Message" -ForegroundColor Green
@@ -26,56 +29,83 @@
         throw $Message
     }
 
-    function Require-Command([string]$Name) {
-        if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
-            Fail "missing required command: $Name"
+    # ── Resolve version tag ──────────────────────────────────────────────
+    $tag = $env:CASB_VERSION
+    if (-not $tag) {
+        Write-Step 'resolving latest release ...'
+        try {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$GH_REPO/releases/latest" -UseBasicParsing
+            $tag = $release.tag_name
+        } catch {
+            Fail "could not fetch latest release from GitHub: $_"
         }
     }
+    Write-Step "version: $tag"
 
-    $repo   = if ($env:CASB_REPO)   { $env:CASB_REPO }   else { 'https://github.com/quangdang46/coding_agent_settings_backup' }
-    $ref    = if ($env:CASB_REF)    { $env:CASB_REF }    else { 'main' }
-    $prefix = if ($env:CASB_PREFIX) { $env:CASB_PREFIX } else { Join-Path $env:USERPROFILE '.cargo' }
+    # ── Resolve install prefix ───────────────────────────────────────────
+    $prefix = if ($env:CASB_PREFIX) { $env:CASB_PREFIX } else { Join-Path $env:USERPROFILE '.casb\bin' }
+    if (-not (Test-Path $prefix)) {
+        New-Item -ItemType Directory -Path $prefix -Force | Out-Null
+    }
 
-    Require-Command 'cargo'
-    Require-Command 'git'
+    # ── Build download URL ───────────────────────────────────────────────
+    $archiveName = "casb-$tag-windows-x86_64.zip"
+    $downloadUrl = "https://github.com/$GH_REPO/releases/download/$tag/$archiveName"
 
-    $rustVersion = (& rustc --version) -split ' ' | Select-Object -Index 1
-    Write-Step "rust $rustVersion detected"
+    Write-Step "downloading $downloadUrl ..."
+    $zipPath = Join-Path $env:TEMP $archiveName
+    try {
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
+    } catch {
+        Fail "download failed: $_`n  URL: $downloadUrl`n  Ensure a release for $tag exists with a Windows binary."
+    }
 
-    Write-Step "installing casb from $repo ($ref) into $prefix\bin"
-
-    $env:CARGO_INSTALL_ROOT = $prefix
-    $cwdHasManifest = Test-Path 'Cargo.toml'
-    if ($cwdHasManifest) {
-        $manifest = Get-Content 'Cargo.toml' -Raw
-        if ($manifest -match 'name = "coding_agent_settings_backup"') {
-            Write-Step 'detected local clone — installing via --path .'
-            & cargo install --path . --locked --force
-            if ($LASTEXITCODE -ne 0) { Fail 'cargo install failed' }
-        } else {
-            $cwdHasManifest = $false
+    # ── Verify SHA-256 if checksum file is available ─────────────────────
+    $sha256Url = "$downloadUrl.sha256"
+    try {
+        $expectedHash = (Invoke-WebRequest -Uri $sha256Url -UseBasicParsing).Content.Trim().Split(' ')[0]
+        $actualHash   = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
+        if ($actualHash -ne $expectedHash) {
+            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+            Fail "SHA-256 mismatch: expected $expectedHash, got $actualHash"
         }
+        Write-Step 'SHA-256 checksum verified'
+    } catch [System.Net.WebException] {
+        Write-Warn 'SHA-256 checksum file not available — skipping verification'
     }
 
-    if (-not $cwdHasManifest) {
-        & cargo install `
-            --git $repo `
-            --branch $ref `
-            --locked `
-            --force `
-            coding_agent_settings_backup
-        if ($LASTEXITCODE -ne 0) { Fail 'cargo install failed' }
+    # ── Extract casb.exe ─────────────────────────────────────────────────
+    Write-Step "extracting to $prefix ..."
+    $extractDir = Join-Path $env:TEMP "casb-extract-$([guid]::NewGuid().ToString('N'))"
+    try {
+        Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+        $exe = Get-ChildItem -Path $extractDir -Filter 'casb.exe' -Recurse | Select-Object -First 1
+        if (-not $exe) { Fail 'casb.exe not found inside the downloaded archive' }
+
+        Copy-Item -Path $exe.FullName -Destination (Join-Path $prefix 'casb.exe') -Force
+    } finally {
+        Remove-Item $zipPath      -Force -ErrorAction SilentlyContinue
+        Remove-Item $extractDir   -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    $bin = Join-Path $prefix 'bin\casb.exe'
+    $bin = Join-Path $prefix 'casb.exe'
     if (-not (Test-Path $bin)) {
-        Fail "installation finished but $bin is missing"
+        Fail "extraction finished but $bin is missing"
     }
     Write-Step "installed: $bin"
 
+    # ── Ensure PREFIX is on PATH ─────────────────────────────────────────
     if (-not (Get-Command casb -ErrorAction SilentlyContinue)) {
-        Write-Warn 'casb is not on PATH; add this to your $PROFILE:'
-        Write-Warn ('    $env:Path = "{0}\bin;" + $env:Path' -f $prefix)
+        # Add to current session.
+        $env:Path = "$prefix;$env:Path"
+
+        # Persist for future sessions (User scope).
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if ($userPath -notlike "*$prefix*") {
+            [Environment]::SetEnvironmentVariable('Path', "$prefix;$userPath", 'User')
+            Write-Step "added $prefix to your User PATH (takes effect in new terminals)"
+        }
     }
 
     Write-Step 'running casb version'
