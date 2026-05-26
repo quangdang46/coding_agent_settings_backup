@@ -2,7 +2,8 @@ name: Release
 
 on:
   push:
-    tags: [v*]
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
@@ -12,93 +13,103 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
             suffix: linux-x86_64
-
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            uses-cross: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
             suffix: linux-aarch64
-
+            uses-cross: true
           - target: x86_64-apple-darwin
-            os: macos-latest
+            runner: macos-latest
             suffix: macos-x86_64
-
+            uses-cross: false
           - target: aarch64-apple-darwin
-            os: macos-latest
+            runner: macos-latest
             suffix: macos-aarch64
-
+            uses-cross: false
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            runner: windows-latest
             suffix: windows-x86_64
-
+            uses-cross: false
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install cross-compilation dependencies (aarch64 linux)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-
-      - name: Package archive (Unix)
-        if: matrix.os != 'windows-latest'
+        with:
+          shared-key: "${{ matrix.target }}"
+          cross-targets: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.uses-cross
+        run: cargo install cross
+      - name: Build release
+        run: |
+          if [ "${{ matrix.uses-cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+      - name: Package
         shell: bash
         run: |
-          BIN_NAME="casb"
-          ARCHIVE="casb-${{ github.ref_name }}-${{ matrix.suffix }}"
+          bin="${{ matrix.target }}/release/casb"
+          [ "${{ matrix.runner }}" = "windows-latest" ] && bin="$bin.exe"
+          
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/$BIN_NAME" "dist/$BIN_NAME"
-          cd dist
-          tar czf "${ARCHIVE}.tar.gz" "$BIN_NAME"
-          sha256sum "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
-          rm "$BIN_NAME"
-
-      - name: Package archive (Windows)
-        if: matrix.os == 'windows-latest'
+          if [ "${{ matrix.runner }}" = "windows-latest" ]; then
+            cp "$bin" dist/casb.exe
+            cd dist
+            powershell -Command "Compress-Archive -Path casb.exe -DestinationPath ../casb-${{ matrix.suffix }}.zip -Force"
+            cd ..
+            rm dist/casb.exe
+          else
+            cp "$bin" dist/casb
+            cd dist
+            tar -czf ../casb-${{ matrix.suffix }}.tar.gz casb
+            cd ..
+            rm dist/casb
+          fi
+      - name: Compute checksum
         shell: bash
         run: |
-          BIN_NAME="casb.exe"
-          ARCHIVE="casb-${{ github.ref_name }}-${{ matrix.suffix }}"
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/$BIN_NAME" "dist/$BIN_NAME"
           cd dist
-          7z a -tzip "${ARCHIVE}.zip" "$BIN_NAME"
-          sha256sum "${ARCHIVE}.zip" > "${ARCHIVE}.zip.sha256"
-          rm "$BIN_NAME"
-
-      - uses: actions/upload-artifact@v4
+          if [ "${{ matrix.runner }}" = "windows-latest" ]; then
+            powershell -Command "(Get-FileHash -Path casb-${{ matrix.suffix }}.zip -Algorithm SHA256).Hash | ForEach-Object { $_ + '  casb-${{ matrix.suffix }}.zip' }" > casb-${{ matrix.suffix }}.zip.sha256
+          else
+            sha256sum casb-${{ matrix.suffix }}.tar.gz > casb-${{ matrix.suffix }}.tar.gz.sha256
+          fi
+          cd ..
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
           name: casb-${{ matrix.suffix }}
-          path: dist/casb-${{ github.ref_name }}-${{ matrix.suffix }}.*
+          path: dist/*
 
-  create-release:
-    name: Create GitHub Release
-    needs: [build]
+  release:
+    name: Release
+    needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
-
-      - name: List artifacts
-        run: find artifacts -type f | sort
-
-      - uses: softprops/action-gh-release@v2
+          pattern: 'casb-*'
+          merge-multiple: true
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
+          files: 'artifacts/*'
           generate_release_notes: true
-          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

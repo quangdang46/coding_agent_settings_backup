@@ -1,75 +1,218 @@
 #!/usr/bin/env bash
-# install.sh — One-liner installer for casb (coding_agent_settings_backup).
-#
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/install.sh | bash
-#   curl -fsSL .../install.sh | CASB_PREFIX=$HOME/.local bash
-#
-# Behaviour:
-#   - Builds casb from source via `cargo install --git`.
-#   - Falls back to `cargo install --path` if invoked from inside a clone.
-#   - Honours CASB_PREFIX (defaults to $HOME/.cargo) and CASB_REF (defaults to main).
-#   - Aborts cleanly if cargo or git are missing.
-
 set -euo pipefail
+umask 022
 
-REPO_URL="${CASB_REPO:-https://github.com/quangdang46/coding_agent_settings_backup}"
-REF="${CASB_REF:-main}"
-PREFIX="${CASB_PREFIX:-$HOME/.cargo}"
+# === Config ===
+BINARY_NAME="casb"
+OWNER="quangdang46"
+REPO="coding_agent_settings_backup"
+DEST="${DEST:-$HOME/.local/bin}"
+VERSION="${VERSION:-}"
+QUIET=0; EASY=0; VERIFY=0; FROM_SOURCE=0; UNINSTALL=0
+MAX_RETRIES=3; DOWNLOAD_TIMEOUT=120
+LOCK_DIR="/tmp/${BINARY_NAME}-install.lock.d"
+TMP=""
 
-log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m==>\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31m==> ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+# === Logging ===
+log_info()    { [ "$QUIET" -eq 1 ] && return; echo "[${BINARY_NAME}] $*" >&2; }
+log_warn()    { echo "[${BINARY_NAME}] WARN: $*" >&2; }
+log_success() { [ "$QUIET" -eq 1 ] && return; echo "✓ $*" >&2; }
+die()         { echo "ERROR: $*" >&2; exit 1; }
 
-require() {
-    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+# === Cleanup & lock ===
+cleanup() { rm -rf "$TMP" "$LOCK_DIR" 2>/dev/null || true; }
+trap cleanup EXIT
+acquire_lock() {
+    mkdir "$LOCK_DIR" 2>/dev/null || die "Another install running. rm -rf $LOCK_DIR"
+    echo $$ > "$LOCK_DIR/pid"
 }
 
+# === Args ===
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dest)       DEST="$2";   shift 2;;
+        --dest=*)     DEST="${1#*=}"; shift;;
+        --version)    VERSION="$2"; shift 2;;
+        --version=*)  VERSION="${1#*=}"; shift;;
+        --system)     DEST="/usr/local/bin"; shift;;
+        --easy-mode)  EASY=1;      shift;;
+        --verify)     VERIFY=1;    shift;;
+        --from-source) FROM_SOURCE=1; shift;;
+        --quiet|-q)   QUIET=1;     shift;;
+        --uninstall)  UNINSTALL=1; shift;;
+        -h|--help)    usage;;
+        *) shift;;
+    esac
+done
+
+usage() {
+    cat <<USAGE
+Usage: install.sh [OPTIONS]
+
+Options:
+  --dest PATH         Install binary to PATH (default: ~/.local/bin)
+  --dest=PATH         Install binary to PATH
+  --version VER       Specific version to install (e.g. v0.1.0)
+  --version=VER       Specific version to install
+  --system            Install to /usr/local/bin (requires sudo)
+  --easy-mode         Also update shell PATH config
+  --verify            Run self-test after install
+  --from-source       Build from source instead of downloading
+  --quiet, -q         Suppress non-error output
+  --uninstall         Remove installed binary
+  -h, --help          Show this help
+
+Install examples:
+  curl -fsSL https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/install.sh | bash
+  curl -fsSL .../install.sh | bash -s -- --easy-mode
+  curl -fsSL .../install.sh | bash -s -- --version v0.1.0
+USAGE
+    exit 0
+}
+
+# === Uninstall ===
+if [ "$UNINSTALL" -eq 1 ]; then
+    rm -f "$DEST/$BINARY_NAME"
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+        [ -f "$rc" ] && sed -i "/${BINARY_NAME} installer/d" "$rc" 2>/dev/null || true
+    done
+    echo "✓ ${BINARY_NAME} uninstalled"; exit 0
+fi
+
+# === Platform ===
+detect_platform() {
+    local os arch
+    case "$(uname -s)" in
+        Linux*)  os="linux";;
+        Darwin*) os="darwin";;
+        MINGW*|MSYS*|CYGWIN*) os="windows";;
+        *) die "Unsupported OS: $(uname -s)";;
+    esac
+    case "$(uname -m)" in
+        x86_64|amd64)  arch="x86_64";;
+        aarch64|arm64) arch="aarch64";;
+        *) die "Unsupported arch: $(uname -m)";;
+    esac
+    echo "${os}_${arch}"
+}
+
+# === Version ===
+resolve_version() {
+    [ -n "$VERSION" ] && return 0
+    VERSION=$(curl -fsSL --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/${OWNER}/${REPO}/releases/latest" 2>/dev/null \
+        | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/') || true
+    if ! [[ "$VERSION" =~ ^v[0-9] ]]; then
+        VERSION=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+            "https://github.com/${OWNER}/${REPO}/releases/latest" 2>/dev/null \
+            | sed -E 's|.*/tag/||') || true
+    fi
+    [[ "$VERSION" =~ ^v[0-9] ]] || die "Could not resolve version"
+    log_info "Latest: $VERSION"
+}
+
+# === Download ===
+download_file() {
+    local url="$1" dest="$2" partial="${2}.part" attempt=0
+    while [ $attempt -lt $MAX_RETRIES ]; do
+        attempt=$((attempt + 1))
+        curl -fL --connect-timeout 30 --max-time "$DOWNLOAD_TIMEOUT" \
+             -sS --retry 2 \
+             $( [ -s "$partial" ] && echo "--continue-at -") \
+             -o "$partial" "$url" \
+          && mv -f "$partial" "$dest" && return 0
+        [ $attempt -lt $MAX_RETRIES ] && { log_warn "Retry $attempt..."; sleep 3; }
+    done
+    return 1
+}
+
+# === Atomic install ===
+install_binary_atomic() {
+    local tmp="${2}.tmp.$$"
+    install -m 0755 "$1" "$tmp" && mv -f "$tmp" "$2" || { rm -f "$tmp"; die "Install failed"; }
+}
+
+# === PATH ===
+maybe_add_path() {
+    case ":$PATH:" in *":$DEST:"*) return 0;; esac
+    if [ "$EASY" -eq 1 ]; then
+        for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+            [ -f "$rc" ] && [ -w "$rc" ] || continue
+            grep -qF "$DEST" "$rc" && continue
+            printf '\nexport PATH="%s:$PATH"  # %s installer\n' "$DEST" "$BINARY_NAME" >> "$rc"
+        done
+    fi
+    log_warn "Restart shell or: export PATH=\"$DEST:\$PATH\""
+}
+
+# === Source build ===
+build_from_source() {
+    command -v cargo >/dev/null || die "cargo not found — install Rust: https://rustup.rs"
+    git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
+    (cd "$TMP/src" && CARGO_TARGET_DIR="$TMP/target" cargo build --release)
+    install_binary_atomic "$TMP/target/release/$BINARY_NAME" "$DEST/$BINARY_NAME"
+}
+
+# === Main ===
 main() {
-    require cargo
-    require git
+    acquire_lock
+    TMP=$(mktemp -d)
+    mkdir -p "$DEST"
 
-    local rust_version
-    rust_version="$(rustc --version | awk '{print $2}')"
-    log "rust $rust_version detected"
+    local platform; platform=$(detect_platform)
+    log_info "Platform: $platform | Dest: $DEST"
 
-    log "installing casb from $REPO_URL ($REF) into $PREFIX/bin"
-    if [[ -f "Cargo.toml" ]] && grep -q 'name = "coding_agent_settings_backup"' Cargo.toml 2>/dev/null; then
-        log "detected local clone — installing via --path ."
-        CARGO_INSTALL_ROOT="$PREFIX" cargo install --path . --locked --force
+    if [ "$FROM_SOURCE" -eq 0 ]; then
+        resolve_version
+        local ext="tar.gz"; [[ "$platform" == windows* ]] && ext="zip"
+        local archive="${BINARY_NAME}-${VERSION}-${platform}.${ext}"
+        local url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive}"
+
+        if download_file "$url" "$TMP/$archive"; then
+            # Verify checksum if sidecar exists
+            if download_file "${url}.sha256" "$TMP/checksum.sha256" 2>/dev/null; then
+                local expected actual
+                expected=$(awk '{print $1}' "$TMP/checksum.sha256")
+                actual=$(sha256sum "$TMP/$archive" 2>/dev/null | awk '{print $1}' \
+                      || shasum -a 256 "$TMP/$archive" | awk '{print $1}')
+                [ "$expected" = "$actual" ] || die "Checksum mismatch"
+                log_info "Checksum verified"
+            fi
+            # Extract
+            case "$archive" in
+                *.tar.gz) tar -xzf "$TMP/$archive" -C "$TMP";;
+                *.zip)    unzip -q "$TMP/$archive" -d "$TMP";;
+            esac
+            local bin; bin=$(find "$TMP" -name "$BINARY_NAME" -type f -perm -111 \
+                          2>/dev/null | head -1)
+            [ -n "$bin" ] || bin=$(find "$TMP" -name "$BINARY_NAME.exe" -type f \
+                          2>/dev/null | head -1)
+            [ -n "$bin" ] || die "Binary not found after extract"
+            install_binary_atomic "$bin" "$DEST/$BINARY_NAME"
+        else
+            log_warn "Binary download failed — building from source..."
+            build_from_source
+        fi
     else
-        CARGO_INSTALL_ROOT="$PREFIX" cargo install \
-            --git "$REPO_URL" \
-            --branch "$REF" \
-            --locked \
-            --force \
-            coding_agent_settings_backup
+        build_from_source
     fi
 
-    local bin="$PREFIX/bin/casb"
-    if [[ ! -x "$bin" ]]; then
-        die "installation finished but $bin is not executable"
-    fi
-    log "installed: $bin"
+    maybe_add_path
 
-    if ! command -v casb >/dev/null 2>&1; then
-        warn "casb is not on PATH; add this to your shell rc:"
-        warn "    export PATH=\"$PREFIX/bin:\$PATH\""
-    fi
+    [ "$VERIFY" -eq 1 ] && "$DEST/$BINARY_NAME" --version
 
-    log "running casb version"
-    "$bin" version
-
-    cat <<'NEXT'
-
-Next steps:
-  1. casb init                # create the backup root
-  2. casb list                # see installed agents
-  3. casb backup              # back up everything that's installed
-  4. casb doctor              # verify the install
-
-Configuration lives at ~/.config/casb/config.toml (run `casb config init`).
-NEXT
+    echo ""
+    echo "✓ $BINARY_NAME installed → $DEST/$BINARY_NAME"
+    echo "  $("$DEST/$BINARY_NAME" --version 2>/dev/null || true)"
+    echo ""
+    echo "  Next steps:"
+    echo "    $BINARY_NAME init                # create the backup root"
+    echo "    $BINARY_NAME list                # see installed agents"
+    echo "    $BINARY_NAME backup              # back up everything"
+    echo ""
 }
 
-main "$@"
+# curl|bash safety: buffer entire script before executing
+if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]] || [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+    { main "$@"; }
+fi
