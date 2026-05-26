@@ -147,7 +147,7 @@ pub fn restore_agent(
     force: bool,
     dry_run: bool,
 ) -> Result<(RestorePreview, RestoreOutcome)> {
-    let repo = require_repo(cfg, agent)?;
+    let repo = require_repo(cfg)?;
     let refname = reference.unwrap_or("HEAD").to_string();
     let (preview, tmp) = build_preview(&repo, agent, &refname)?;
     let target_path: PathBuf = tmp.path().to_path_buf();

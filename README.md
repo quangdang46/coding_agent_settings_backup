@@ -5,9 +5,9 @@
 
 `casb` (Coding Agent Settings Backup) is a Rust-powered CLI that backs up,
 versions, and restores configuration folders for AI coding agents
-(Claude Code, Codex, Cursor, Gemini, OpenCode, Kiro, …) using per-agent
-**git repositories**. It is a feature-complete, type-safe port of the
-original [`asb`](https://github.com/quangdang46/agent_settings_backup_script)
+(Claude Code, Codex, Cursor, Gemini, OpenCode, Kiro, …) using a **single
+shared git repository** at the backup root. It is a feature-complete,
+type-safe port of the original [`asb`](https://github.com/quangdang46/agent_settings_backup_script)
 bash script with first-class support for multi-location agents and SQLite
 state files.
 
@@ -19,7 +19,7 @@ state files.
 - **Multi-location support**: Claude (`~/.claude/`, `~/.local/share/claude/`,
   `~/.claude.json`) and OpenCode (`~/.config/opencode/`,
   `~/.local/share/opencode/`) are merged into a single backup repo per agent.
-- **Per-agent git repositories** under `~/.agent_settings_backups/.<agent>/`.
+- **Single shared git repository** at `~/.agent_settings_backups/.git`.
 - **Smart filtering** with sensible defaults plus per-agent `.casbignore`.
 - **SQLite state databases are backed up** (only `*.sqlite3-wal` /
   `*.sqlite3-shm` temp files are excluded).
@@ -159,17 +159,15 @@ order; a non-zero exit aborts the operation.
 
 ```
 ~/.agent_settings_backups/
+├── .git/                   # ONE shared git repository for all agents
 ├── README.md
-├── .claude/                # one git repo per agent
-│   ├── .git/
-│   ├── .gitignore
-│   ├── home/               # from ~/.claude/
+├── .claude/                # from ~/.claude/
+│   ├── home/               # settings, hooks, skills (projects/, transcripts/, plans/ excluded)
 │   ├── data/               # from ~/.local/share/claude/
-│   └── claude.json         # from ~/.claude.json (root-level file)
-├── .codex/
-│   ├── .git/
-│   └── …                   # contents of ~/.codex/
-├── .opencode/
+│   └── root/              # ~/.claude.json
+├── .codex/                 # from ~/.codex/
+│   └── …
+├── .opencode/              # merged from 2 locations
 │   ├── config/             # from ~/.config/opencode/
 │   └── data/               # from ~/.local/share/opencode/
 └── …
@@ -179,7 +177,7 @@ order; a non-zero exit aborts the operation.
 
 ```sh
 cargo build --release       # produces ./target/release/casb (~2.9 MB)
-cargo test                  # 63 unit + 8 E2E tests
+cargo test                  # 65 unit + 12 E2E tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 ```

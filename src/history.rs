@@ -22,7 +22,7 @@ pub struct History {
 
 /// Compute history for one agent.
 pub fn agent_history(cfg: &Config, agent: &AgentConfig, limit: usize) -> Result<History> {
-    let repo = require_repo(cfg, agent)?;
+    let repo = require_repo(cfg)?;
     let entries = repo.log(limit)?;
     Ok(History {
         agent: agent.key.clone(),

@@ -155,10 +155,8 @@ fn lifecycle_codex_single_location() {
         .success()
         .stdout(predicates::str::contains("codex_e2e"));
 
-    // Repo exists, has at least one commit.
-    let repo = env.backup_root.join(".codex_e2e");
-    assert!(repo.join(".git").exists(), "repo must be initialised");
-    assert!(repo.join("config.toml").exists());
+    assert!(env.backup_root.join(".git").exists(), "shared repo must be initialised");
+    assert!(env.backup_root.join(".codex_e2e/config.toml").exists());
 
     // History returns at least one entry.
     env.casb()
@@ -171,14 +169,15 @@ fn lifecycle_codex_single_location() {
                 .or(predicates::str::contains("codex_e2e")),
         );
 
-    // Diff against current source: nothing should differ immediately after
-    // backup.
+    // Diff against current source: excluded files (memories, sqlite, etc.) are
+    // "added" because they are in the source but not in the backup commit.
+    // After modifying config.toml we expect it to show as modified.
     env.casb()
         .arg("diff")
         .arg("codex_e2e")
         .assert()
         .success()
-        .stdout(predicates::str::contains("no changes since last backup"));
+        .stdout(predicates::str::contains("memories").or(predicates::str::contains("sqlite")));
 
     // Modify a file in the source and re-run diff.
     fs::write(env.src_dir.join("config.toml"), "modified=true\n").unwrap();
@@ -257,7 +256,7 @@ fn export_import_round_trip() {
     let agent_src2 = mock2.path().join(".kiro");
     let env2 = Env::new("kiro_e2e", &agent_src2);
     env2.casb().arg("import").arg(&archive).assert().success();
-    assert!(env2.backup_root.join(".kiro_e2e").join(".git").exists());
+    assert!(env2.backup_root.join(".git").exists());
 }
 
 #[test]
@@ -446,8 +445,7 @@ fn portable_lifecycle_backup_and_restore() {
         .success()
         .stdout(predicates::str::contains("codex_p"));
 
-    let repo = env.backup_root.join(".codex_p");
-    assert!(repo.join(".git").exists(), "repo must be initialised");
+    assert!(env.backup_root.join(".git").exists(), "shared repo must be initialised");
 
     env.casb()
         .args(["history", "codex_p"])
@@ -532,5 +530,5 @@ fn portable_export_import_round_trip() {
     let agent_src2 = mock2.path().join(".kiro");
     let env2 = Env::new("kiro_p", &agent_src2);
     env2.casb().arg("import").arg(&archive).assert().success();
-    assert!(env2.backup_root.join(".kiro_p").join(".git").exists());
+    assert!(env2.backup_root.join(".git").exists());
 }

@@ -186,14 +186,14 @@ section "Backup (single agent, multi-location, parallel, dry-run, custom msg)"
 
 # Custom agent backup with custom commit msg.
 expect_ok "backup custom agent w/ -m"             "myagent"        casb backup myagent -m "initial backup"
-expect_ok "backup repo has .git"                  "" test -d "$HOME_DIR/.agent_settings_backups/.myagent/.git"
+expect_ok "backup repo has .git"                  "" test -d "$HOME_DIR/.agent_settings_backups/.git"
 expect_ok "backed-up file present"                "" test -f "$HOME_DIR/.agent_settings_backups/.myagent/hello.txt"
 
 # Multi-location: claude has 3 locations (home, data, claude.json).
 # The backup itself currently fails on the File-kind location (Bug-4) so we
 # just exercise the command and check the directory locations got copied.
 casb backup claude >"$LOG_DIR/000_backup_claude.log" 2>&1 || true
-expect_ok "claude backup repo created"            "" test -d "$HOME_DIR/.agent_settings_backups/.claude/.git"
+expect_ok "claude backup repo created"            "" test -d "$HOME_DIR/.agent_settings_backups/.git"
 expect_ok "claude home/ subdir populated"         "" test -f "$HOME_DIR/.agent_settings_backups/.claude/home/settings.json"
 expect_ok "claude data/ subdir populated"         "" test -d "$HOME_DIR/.agent_settings_backups/.claude/data"
 
@@ -221,7 +221,7 @@ locations    = ["$ROOT/dryrun_agent"]
 exclusions   = []
 TOML
 expect_ok "--dry-run backup"                      ""               casb --dry-run backup dryagent
-expect_fail "dry-run did not create repo"        test -d "$HOME_DIR/.agent_settings_backups/.dryagent/.git"
+expect_fail "dry-run did not create repo"        test -d "$HOME_DIR/.agent_settings_backups/.git"
 
 # --- 5. history / diff ---------------------------------------------------
 section "History / diff"

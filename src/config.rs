@@ -112,8 +112,11 @@ pub struct CustomAgentConfig {
 
 /// The default exclusion patterns applied to every agent.
 ///
+/// The default exclusion patterns applied to every agent.
+///
 /// Covers common ephemeral or large directories produced by AI coding agents
-/// (logs, sessions, node_modules, temp artifacts) on top of OS-level junk.
+/// (logs, sessions, node_modules, temp artifacts) that are not user-relevant
+/// configuration data.
 pub fn default_exclusions() -> Vec<String> {
     vec![
         // OS / editor junk
@@ -124,6 +127,7 @@ pub fn default_exclusions() -> Vec<String> {
         "*.temp".into(),
         "*.swp".into(),
         "*~".into(),
+        "*.bak".into(),
         // Logs (often gigabytes in practice, e.g. Codex's codex-tui.log)
         "*.log".into(),
         "**/log/**".into(),
@@ -134,19 +138,42 @@ pub fn default_exclusions() -> Vec<String> {
         "**/Cache/**".into(),
         "**/.cache/**".into(),
         "**/paste-cache/**".into(),
-        // SQLite WAL / SHM (ephemeral, recreated by SQLite)
+        // SQLite databases
+        "*.sqlite".into(),
+        "*.sqlite3".into(),
         "*.sqlite3-wal".into(),
         "*.sqlite3-shm".into(),
         // Session / replay / timeline data (not configuration)
         "**/sessions/**".into(),
         "**/logseq/**".into(),
-        // Node modules (huge, never configuration)
+        "**/history/**".into(),
+        "**/history.jsonl".into(),
+        "**/session_index.jsonl".into(),
+        "**/files-history/**".into(),
+        // Claude Code specific (LARGE - not user config)
+        "**/projects/**".into(),
+        "**/transcripts/**".into(),
+        "**/plans/**".into(),
+        "**/skill-learning/**".into(),
+        "**/*.jsonl".into(),
+        "**/tasks/**".into(),
+        // Memories (Codex etc - AI-generated summaries, not config)
+        "**/memories/**".into(),
+        // Shell snapshots
+        "**/shell_snapshots/**".into(),
+        "**/shell_snapshot/**".into(),
+        // Downloads (if any exist in agent dirs)
+        "**/downloads/**".into(),
+        // Python/JS dependencies (never config)
         "**/node_modules/**".into(),
+        "**/__pycache__/**".into(),
+        "**/.venv/**".into(),
+        "**/venv/**".into(),
+        // Blob storage directories (OpenCode etc)
+        "**/storage/**".into(),
         // Agent temp / workdirs
         "**/tmp/**".into(),
         "**/temp/**".into(),
-        // Shell snapshots (Codex shell_snapshots)
-        "**/shell_snapshots/**".into(),
     ]
 }
 

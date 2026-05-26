@@ -38,9 +38,8 @@ impl SyncStats {
 
 /// Sync every existing location of `agent` into `dest_root`.
 ///
-/// `dest_root` is the per-agent backup repository directory. Each location
-/// is written to `dest_root/<backup_subdir>` (or directly to `dest_root` for
-/// `backup_subdir == "."`).
+/// `dest_root` is the backup root (single `.git` repo for all agents).
+/// Each location is written to `dest_root/<backup_subdir>`.
 pub fn sync_agent_to_backup(
     agent: &AgentConfig,
     dest_root: &Path,
@@ -51,13 +50,6 @@ pub fn sync_agent_to_backup(
     let mut total = SyncStats::default();
     if !dest_root.exists() && !dry_run {
         std::fs::create_dir_all(dest_root)?;
-    }
-
-    // Drop subdirs that no longer correspond to any installed location;
-    // otherwise stale data would persist forever in the repo. Skip the
-    // `.git` directory and the root `.gitignore` we create.
-    if !dry_run {
-        prune_stale_subdirs(agent, dest_root)?;
     }
 
     for loc in agent.installed_locations() {
@@ -117,6 +109,11 @@ pub fn sync_backup_to_agent(
 }
 
 /// Compute the destination subpath for a single agent location.
+///
+/// All agents now use explicit `backup_subdir` values (e.g., `.claude/home`,
+/// `.codex`). The single `.git` repo lives at `dest_root` directly (which is
+/// `backup_root` for all agents), so every location's content lands under an
+/// agent-prefixed subdirectory.
 pub fn backup_dest_for(dest_root: &Path, loc: &AgentLocation) -> PathBuf {
     if matches!(loc.kind, LocationKind::File) {
         // Files are stored under the subdir as their basename.
@@ -125,41 +122,21 @@ pub fn backup_dest_for(dest_root: &Path, loc: &AgentLocation) -> PathBuf {
             .file_name()
             .map(|s| s.to_os_string())
             .unwrap_or_else(|| std::ffi::OsString::from("file"));
-        if loc.backup_subdir == "." || loc.backup_subdir.is_empty() {
-            dest_root.join(name)
-        } else {
-            dest_root.join(&loc.backup_subdir).join(name)
-        }
-    } else if loc.backup_subdir == "." || loc.backup_subdir.is_empty() {
-        dest_root.to_path_buf()
+        dest_root.join(&loc.backup_subdir).join(name)
     } else {
         dest_root.join(&loc.backup_subdir)
     }
 }
 
-fn prune_stale_subdirs(agent: &AgentConfig, dest_root: &Path) -> Result<()> {
-    let known: std::collections::HashSet<String> = agent
-        .locations
-        .iter()
-        .map(|l| {
-            if matches!(l.kind, LocationKind::File) {
-                // For root files we don't prune anything: they live as
-                // basenames. The basename will be overwritten on copy.
-                "<file>".to_string()
-            } else if l.backup_subdir == "." || l.backup_subdir.is_empty() {
-                "<root>".to_string()
-            } else {
-                l.backup_subdir.clone()
-            }
-        })
-        .collect();
+/// Prune stale subdirectories from `dest_root` after all agents have synced.
+pub fn prune_stale_subdirs(
+    known_subdirs: &std::collections::HashSet<String>,
+    dest_root: &Path,
+) -> Result<()> {
     if !dest_root.exists() {
         return Ok(());
     }
 
-    // If any location uses the root, we cannot safely delete unknown root
-    // entries because they may be valid agent files. The `.git` dir and the
-    // top-level `.gitignore` we create are always preserved.
     for entry in std::fs::read_dir(dest_root)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -167,16 +144,11 @@ fn prune_stale_subdirs(agent: &AgentConfig, dest_root: &Path) -> Result<()> {
         if name_str == ".git" || name_str == ".gitignore" || name_str == ".casbignore" {
             continue;
         }
-        if entry.file_type()?.is_dir() && !known.contains(&name_str) {
-            // Only prune if no location uses '.' as backup_subdir AND the
-            // directory name matches one of the previously known subdirs
-            // ('home', 'data', 'config', 'root'). This is conservative.
-            if known.contains("<root>") {
-                continue;
-            }
-            if matches!(name_str.as_str(), "home" | "data" | "config" | "root") {
-                std::fs::remove_dir_all(entry.path())?;
-            }
+        if entry.file_type()?.is_dir()
+            && name_str.starts_with('.')
+            && !known_subdirs.contains(&name_str)
+        {
+            std::fs::remove_dir_all(entry.path())?;
         }
     }
     Ok(())
@@ -447,14 +419,14 @@ mod tests {
             display_name: "K".into(),
             category: crate::agent::AgentCategory::CliCoding,
             locations: vec![
-                make_loc(src1.path().to_path_buf(), "home"),
-                make_loc(src2.path().to_path_buf(), "data"),
+                make_loc(src1.path().to_path_buf(), ".k/home"),
+                make_loc(src2.path().to_path_buf(), ".k/data"),
             ],
         };
         let filter = ExclusionFilter::new(vec![]).unwrap();
         sync_agent_to_backup(&agent, dest.path(), &filter, false, false).unwrap();
-        assert!(dest.path().join("home/home.txt").exists());
-        assert!(dest.path().join("data/data.txt").exists());
+        assert!(dest.path().join(".k/home/home.txt").exists());
+        assert!(dest.path().join(".k/data/data.txt").exists());
     }
 
     /// Regression: a [`LocationKind::File`] backed up under a `backup_subdir`
@@ -475,13 +447,13 @@ mod tests {
                 path: file_src,
                 location_type: LocationType::HomeDir,
                 kind: LocationKind::File,
-                backup_subdir: "root".into(),
+                backup_subdir: ".claude/root".into(),
             }],
         };
         let filter = ExclusionFilter::new(vec![]).unwrap();
         sync_agent_to_backup(&agent, dest.path(), &filter, false, false).unwrap();
 
-        let copied = dest.path().join("root/.claude.json");
+        let copied = dest.path().join(".claude/root/.claude.json");
         assert!(copied.is_file(), "{copied:?} must be a file, not a dir");
         assert_eq!(std::fs::read_to_string(&copied).unwrap(), "{}");
     }

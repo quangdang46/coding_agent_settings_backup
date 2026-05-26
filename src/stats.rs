@@ -4,7 +4,6 @@
 //! disk, number of installed agents, and total bytes.
 
 use crate::agent::Registry;
-use crate::backup::agent_repo_path;
 use crate::config::Config;
 use crate::error::Result;
 use crate::git::Repo;
@@ -53,22 +52,26 @@ pub fn compute_stats(cfg: &Config, registry: &Registry, key: Option<&str>) -> Re
     let mut total_source = 0u64;
     let mut total_commits = 0u64;
 
+    // Shared repo stats (single .git at backup_root, same for all agents).
+    let backup_root = cfg.backup_root();
+    let repo = Repo::new(&backup_root);
+    let repo_exists = repo.exists();
+    let repo_commits = if repo_exists { repo.commit_count()? } else { 0 };
+    let repo_bytes_total = if repo_exists { dir_size(&backup_root) } else { 0 };
+
     for agent in agents {
-        let repo_path = agent_repo_path(&cfg.backup_root(), agent);
-        let repo = Repo::new(&repo_path);
-        let exists = repo.exists();
-        let commits = if exists { repo.commit_count()? } else { 0 };
-        let repo_bytes = if exists { dir_size(&repo_path) } else { 0 };
         let source_bytes: u64 = agent.installed_locations().map(|l| dir_size(&l.path)).sum();
-        total_repo += repo_bytes;
+        // Each agent's backup content lives in its subdirs; size is the whole
+        // repo since all agents share one .git (shown as repo_bytes for each).
+        total_repo += repo_bytes_total;
         total_source += source_bytes;
-        total_commits += commits;
+        total_commits += repo_commits;
         entries.push(AgentStats {
             agent: agent.key.clone(),
             installed: agent.is_installed(),
-            repo_exists: exists,
-            commits,
-            repo_bytes,
+            repo_exists,
+            commits: repo_commits,
+            repo_bytes: repo_bytes_total,
             source_bytes,
         });
     }

@@ -3,7 +3,6 @@
 //! Thin wrappers around the git tag operations. The `restore-from-tag` path
 //! reuses the existing [`crate::restore`] flow.
 
-use crate::agent::AgentConfig;
 use crate::backup::require_repo;
 use crate::config::Config;
 use crate::error::Result;
@@ -18,20 +17,15 @@ pub struct TagEntry {
 }
 
 /// Create a tag at HEAD with optional annotated message.
-pub fn create_tag(
-    cfg: &Config,
-    agent: &AgentConfig,
-    name: &str,
-    message: Option<&str>,
-) -> Result<()> {
-    let repo = require_repo(cfg, agent)?;
+pub fn create_tag(cfg: &Config, _agent: &crate::agent::AgentConfig, name: &str, message: Option<&str>) -> Result<()> {
+    let repo = require_repo(cfg)?;
     repo.tag_create(name, message)?;
     Ok(())
 }
 
 /// List tags with their target commit.
-pub fn list_tags(cfg: &Config, agent: &AgentConfig) -> Result<Vec<TagEntry>> {
-    let repo = require_repo(cfg, agent)?;
+pub fn list_tags(cfg: &Config, _agent: &crate::agent::AgentConfig) -> Result<Vec<TagEntry>> {
+    let repo = require_repo(cfg)?;
     let pairs = repo.tag_pairs()?;
     let mut entries: Vec<TagEntry> = pairs
         .into_iter()
@@ -42,8 +36,8 @@ pub fn list_tags(cfg: &Config, agent: &AgentConfig) -> Result<Vec<TagEntry>> {
 }
 
 /// Delete a tag.
-pub fn delete_tag(cfg: &Config, agent: &AgentConfig, name: &str) -> Result<()> {
-    let repo = require_repo(cfg, agent)?;
+pub fn delete_tag(cfg: &Config, _agent: &crate::agent::AgentConfig, name: &str) -> Result<()> {
+    let repo = require_repo(cfg)?;
     repo.tag_delete(name)?;
     Ok(())
 }

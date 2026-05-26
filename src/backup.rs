@@ -1,7 +1,9 @@
-//! `casb backup` implementation.
+//! Per-agent and whole-backup orchestration: single shared git repo at backup root.
 //!
-//! Per-agent: create the backup repo if missing, sync the agent's source
-//! locations into it (respecting exclusions), and commit the result.
+//! Key invariants of the single-.git layout:
+//! - All agents share ONE `.git/` directory at `backup_root/.git`.
+//! - Agent content lives in agent-keyed subdirectories (`.claude/`, `.codex/`, …).
+//! - `prune_stale_subdirs` is called ONCE after all agents sync, never per-agent.
 
 use crate::agent::{AgentConfig, Registry};
 use crate::config::Config;
@@ -13,6 +15,7 @@ use crate::sync::{sync_agent_to_backup, SyncStats};
 use crate::util::{expand_tilde, format_bytes};
 use chrono::Utc;
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Outcome of backing up a single agent.
@@ -32,14 +35,12 @@ pub struct BackupOutcome {
     pub error: Option<String>,
 }
 
-/// Compute the backup repo path for a given agent.
-pub fn agent_repo_path(backup_root: &Path, agent: &AgentConfig) -> PathBuf {
-    backup_root.join(format!(".{}", agent.key))
+/// In the single-.git layout all agents share one repo at `backup_root`.
+pub fn agent_repo_path(backup_root: &Path, _agent: &AgentConfig) -> PathBuf {
+    backup_root.to_path_buf()
 }
 
 /// Backup all installed agents (or `keys` if non-empty).
-///
-/// Returns one [`BackupOutcome`] per agent considered.
 pub fn backup_agents(
     cfg: &Config,
     registry: &Registry,
@@ -64,6 +65,15 @@ pub fn backup_agents(
 
     if agents.is_empty() {
         return Ok(Vec::new());
+    }
+
+    // Initialize the single .git repo at backup_root (once, not per-agent).
+    if !dry_run {
+        let repo = Repo::new(&backup_root);
+        if !repo.exists() {
+            repo.init()?;
+            write_default_gitignore(&backup_root, &cfg.backup.exclusions)?;
+        }
     }
 
     let do_one = |agent: &AgentConfig| -> BackupOutcome {
@@ -92,6 +102,16 @@ pub fn backup_agents(
         agents.iter().map(|a| do_one(a)).collect()
     };
 
+    // Prune stale agent subdirs after all agents have synced.
+    if !dry_run {
+        let known_subdirs: HashSet<String> = agents
+            .iter()
+            .flat_map(|a| a.installed_locations())
+            .map(|l| l.backup_subdir.clone())
+            .collect();
+        crate::sync::prune_stale_subdirs(&known_subdirs, &backup_root)?;
+    }
+
     Ok(outcomes)
 }
 
@@ -112,17 +132,8 @@ fn backup_one(
             error: None,
         });
     }
-    let repo_path = agent_repo_path(backup_root, agent);
-    let repo = Repo::new(&repo_path);
-    if !dry_run {
-        if !repo.exists() {
-            repo.init()?;
-            write_repo_readme(&repo_path, agent)?;
-        }
-        write_default_gitignore(&repo_path, &cfg.backup.exclusions)?;
-    }
+    let repo = Repo::new(backup_root);
 
-    // Build filter: defaults + extras + per-agent extras (from config).
     let agent_extras = cfg
         .agents
         .get(&agent.key)
@@ -133,34 +144,39 @@ fn backup_one(
         &cfg.backup.exclusions,
         &agent_extras,
     )?;
-    // Also merge `.casbignore` files at the source roots.
     for loc in agent.installed_locations() {
         if matches!(loc.kind, crate::agent::LocationKind::Directory) {
             let candidate = loc.path.join(".casbignore");
             filter.merge_casbignore_file(&candidate)?;
         }
     }
-    // And from the backup repo itself.
-    filter.merge_casbignore_file(&repo_path.join(".casbignore"))?;
+    filter.merge_casbignore_file(&backup_root.join(".casbignore"))?;
 
-    // Hooks (pre-backup), only when not dry-run.
     if !dry_run {
         run_hooks(HookKind::PreBackup, &agent.key)?;
     }
 
-    let stats = sync_agent_to_backup(agent, &repo_path, &filter, cfg.backup.use_rsync, dry_run)?;
+    let stats = sync_agent_to_backup(
+        agent,
+        backup_root,
+        &filter,
+        cfg.backup.use_rsync,
+        dry_run,
+    )?;
 
     let mut committed = false;
     let mut commit = None;
     if !dry_run && cfg.general.auto_commit {
         repo.add_all()?;
-        let msg = message.map(|s| s.to_string()).unwrap_or_else(|| {
-            format!(
-                "casb backup {} at {}",
-                agent.key,
-                Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-            )
-        });
+        let msg = message
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                format!(
+                    "casb backup {} at {}",
+                    agent.key,
+                    Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                )
+            });
         committed = repo.commit(&msg)?;
         commit = repo.head_short()?;
     } else if !dry_run {
@@ -201,31 +217,11 @@ fn write_root_readme(root: &Path) -> Result<()> {
     let body = format!(
         "# Coding Agent Settings Backups\n\n\
          This directory is managed by `casb` (coding_agent_settings_backup).\n\
-         Each subdirectory beginning with `.` is a per-agent git repository\n\
-         containing snapshots of that agent's configuration over time.\n\n\
+         All agents share a single git repository at this root; agent-specific\n\
+         content lives in agent-keyed subdirectories (e.g. `.claude/`, `.codex/`).\n\n\
          Created at: {}\n",
         Utc::now().to_rfc3339()
     );
-    std::fs::write(path, body)?;
-    Ok(())
-}
-
-fn write_repo_readme(repo: &Path, agent: &AgentConfig) -> Result<()> {
-    let path = repo.join("README.md");
-    if path.exists() {
-        return Ok(());
-    }
-    let mut body = format!(
-        "# {}\n\nManaged by `casb`. Source locations:\n\n",
-        agent.display_name
-    );
-    for loc in &agent.locations {
-        body.push_str(&format!(
-            "- {} ({:?})\n",
-            loc.path.display(),
-            loc.location_type
-        ));
-    }
     std::fs::write(path, body)?;
     Ok(())
 }
@@ -248,13 +244,12 @@ fn write_default_gitignore(repo: &Path, extras: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Ensure a backup repo exists and returns a [`Repo`] handle.
-pub fn require_repo(cfg: &Config, agent: &AgentConfig) -> Result<Repo> {
-    let path = agent_repo_path(&cfg.backup_root(), agent);
-    let repo = Repo::new(path);
+/// Ensure the backup repo exists and returns a [`Repo`] handle.
+pub fn require_repo(cfg: &Config) -> Result<Repo> {
+    let repo = Repo::new(cfg.backup_root());
     if !repo.exists() {
         return Err(CasbError::NoBackupRepo {
-            key: agent.key.clone(),
+            key: "backup root".into(),
         });
     }
     Ok(repo)
@@ -296,7 +291,7 @@ mod tests {
                 path: src.to_path_buf(),
                 location_type: LocationType::HomeDir,
                 kind: LocationKind::Directory,
-                backup_subdir: ".".into(),
+                backup_subdir: format!(".{key}"),
             }],
         }
     }
@@ -304,13 +299,12 @@ mod tests {
     fn cfg_for(root: &std::path::Path) -> Config {
         let mut c = Config::default();
         c.general.backup_root = root.display().to_string();
-        // Force walkdir backend in tests so behaviour is deterministic.
         c.backup.use_rsync = false;
         c
     }
 
     #[test]
-    fn agent_repo_path_uses_dot_prefix() {
+    fn agent_repo_path_returns_backup_root() {
         let agent = AgentConfig {
             key: "k".into(),
             display_name: "K".into(),
@@ -318,7 +312,7 @@ mod tests {
             locations: vec![],
         };
         let p = agent_repo_path(std::path::Path::new("/tmp"), &agent);
-        assert_eq!(p, std::path::PathBuf::from("/tmp/.k"));
+        assert_eq!(p, std::path::PathBuf::from("/tmp"));
     }
 
     #[test]
@@ -329,6 +323,7 @@ mod tests {
         let cfg = cfg_for(backup_root.path());
         let agent = make_agent("test1", src.path());
 
+        // Unknown key bubbles up.
         let outcomes = backup_agents(
             &cfg,
             &Registry::from_config(&Config::default()).unwrap(),
@@ -337,45 +332,42 @@ mod tests {
             false,
             false,
         );
-        // unknown key bubbles up as AgentNotFound
         assert!(outcomes.is_err());
 
-        // Direct call — sync via internal helper.
-        let repo_path = agent_repo_path(backup_root.path(), &agent);
-        let _ = std::fs::create_dir_all(&repo_path);
-        let outcome = backup_one(&cfg, &agent, backup_root.path(), Some("msg"), false).unwrap();
+        // Initialize the single .git repo (done by backup_agents in real usage).
+        let repo = Repo::new(backup_root.path());
+        repo.init().unwrap();
+        let outcome =
+            backup_one(&cfg, &agent, backup_root.path(), Some("msg"), false).unwrap();
         assert!(outcome.installed);
         assert!(outcome.committed);
-        assert!(repo_path.join(".git").exists());
-        assert!(repo_path.join("a.txt").exists());
+        // .git is at backup_root; file lands in .test1/ subdir.
+        assert!(backup_root.path().join(".git").exists());
+        assert!(backup_root.path().join(".test1").join("a.txt").exists());
     }
 
     #[test]
-    fn backup_dry_run_makes_no_changes() {
+    fn backup_dry_run_does_not_commit() {
         let backup_root = tempdir().unwrap();
         let src = tempdir().unwrap();
         std::fs::write(src.path().join("a.txt"), "x").unwrap();
         let cfg = cfg_for(backup_root.path());
         let agent = make_agent("dry", src.path());
+        let repo = Repo::new(backup_root.path());
+        repo.init().unwrap();
+
         let outcome = backup_one(&cfg, &agent, backup_root.path(), None, true).unwrap();
         assert!(outcome.installed);
-        // Dry run does not commit.
         assert!(!outcome.committed);
-        let repo = agent_repo_path(backup_root.path(), &agent);
-        assert!(!repo.join(".git").exists());
+        // Dry run does not stage new changes.
+        assert!(!outcome.committed);
     }
 
     #[test]
     fn require_repo_errors_when_missing() {
         let backup_root = tempdir().unwrap();
         let cfg = cfg_for(backup_root.path());
-        let agent = AgentConfig {
-            key: "missing".into(),
-            display_name: "M".into(),
-            category: AgentCategory::CliCoding,
-            locations: vec![],
-        };
-        let err = require_repo(&cfg, &agent).unwrap_err();
+        let err = require_repo(&cfg).unwrap_err();
         matches!(err, CasbError::NoBackupRepo { .. });
     }
 

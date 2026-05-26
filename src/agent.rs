@@ -125,9 +125,9 @@ pub fn builtin_agents() -> Result<Vec<AgentConfig>> {
             display_name: "Claude Code".into(),
             category: AgentCategory::CliCoding,
             locations: vec![
-                loc_dir(home.join(".claude"), LocationType::HomeDir, "home"),
-                loc_dir(xdg_data.join("claude"), LocationType::XdgData, "data"),
-                loc_file(home.join(".claude.json"), LocationType::HomeDir, "root"),
+                loc_dir(home.join(".claude"), LocationType::HomeDir, ".claude/home"),
+                loc_dir(xdg_data.join("claude"), LocationType::XdgData, ".claude/data"),
+                loc_file(home.join(".claude.json"), LocationType::HomeDir, ".claude/root"),
             ],
         },
         // 2. Codex
@@ -135,42 +135,42 @@ pub fn builtin_agents() -> Result<Vec<AgentConfig>> {
             key: "codex".into(),
             display_name: "OpenAI Codex CLI".into(),
             category: AgentCategory::CliCoding,
-            locations: vec![loc_dir(home.join(".codex"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".codex"), LocationType::HomeDir, ".codex")],
         },
         // 3. Cursor
         AgentConfig {
             key: "cursor".into(),
             display_name: "Cursor".into(),
             category: AgentCategory::Ide,
-            locations: vec![loc_dir(home.join(".cursor"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".cursor"), LocationType::HomeDir, ".cursor")],
         },
         // 4. Gemini
         AgentConfig {
             key: "gemini".into(),
             display_name: "Google Gemini".into(),
             category: AgentCategory::CliCoding,
-            locations: vec![loc_dir(home.join(".gemini"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".gemini"), LocationType::HomeDir, ".gemini")],
         },
         // 5. Cline
         AgentConfig {
             key: "cline".into(),
             display_name: "Cline".into(),
             category: AgentCategory::Ide,
-            locations: vec![loc_dir(home.join(".cline"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".cline"), LocationType::HomeDir, ".cline")],
         },
         // 6. Amp
         AgentConfig {
             key: "amp".into(),
             display_name: "Amp (Sourcegraph)".into(),
             category: AgentCategory::CliCoding,
-            locations: vec![loc_dir(home.join(".amp"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".amp"), LocationType::HomeDir, ".amp")],
         },
         // 7. Aider
         AgentConfig {
             key: "aider".into(),
             display_name: "Aider".into(),
             category: AgentCategory::CliCoding,
-            locations: vec![loc_dir(home.join(".aider"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".aider"), LocationType::HomeDir, ".aider")],
         },
         // 8. OpenCode (multi-location)
         AgentConfig {
@@ -181,9 +181,9 @@ pub fn builtin_agents() -> Result<Vec<AgentConfig>> {
                 loc_dir(
                     xdg_config.join("opencode"),
                     LocationType::XdgConfig,
-                    "config",
+                    ".opencode/config",
                 ),
-                loc_dir(xdg_data.join("opencode"), LocationType::XdgData, "data"),
+                loc_dir(xdg_data.join("opencode"), LocationType::XdgData, ".opencode/data"),
             ],
         },
         // 9. Factory
@@ -191,14 +191,14 @@ pub fn builtin_agents() -> Result<Vec<AgentConfig>> {
             key: "factory".into(),
             display_name: "Factory Droid".into(),
             category: AgentCategory::CliCoding,
-            locations: vec![loc_dir(home.join(".factory"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".factory"), LocationType::HomeDir, ".factory")],
         },
         // 10. Windsurf
         AgentConfig {
             key: "windsurf".into(),
             display_name: "Windsurf".into(),
             category: AgentCategory::Ide,
-            locations: vec![loc_dir(home.join(".windsurf"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".windsurf"), LocationType::HomeDir, ".windsurf")],
         },
         // 11. Plandex
         AgentConfig {
@@ -208,7 +208,7 @@ pub fn builtin_agents() -> Result<Vec<AgentConfig>> {
             locations: vec![loc_dir(
                 home.join(".plandex-home"),
                 LocationType::HomeDir,
-                ".",
+                ".plandex",
             )],
         },
         // 12. Qwen Code
@@ -216,56 +216,56 @@ pub fn builtin_agents() -> Result<Vec<AgentConfig>> {
             key: "qwencode".into(),
             display_name: "Qwen Code".into(),
             category: AgentCategory::CliCoding,
-            locations: vec![loc_dir(home.join(".qwen"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".qwen"), LocationType::HomeDir, ".qwen")],
         },
         // 13. Amazon Q
         AgentConfig {
             key: "amazonq".into(),
             display_name: "Amazon Q".into(),
             category: AgentCategory::CliCoding,
-            locations: vec![loc_dir(home.join(".q"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".q"), LocationType::HomeDir, ".amazonq")],
         },
         // 14. Kiro (NEW)
         AgentConfig {
             key: "kiro".into(),
             display_name: "Kiro".into(),
             category: AgentCategory::CliCoding,
-            locations: vec![loc_dir(home.join(".kiro"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".kiro"), LocationType::HomeDir, ".kiro")],
         },
         // 15. Continue (NEW)
         AgentConfig {
             key: "continue".into(),
             display_name: "Continue".into(),
             category: AgentCategory::Ide,
-            locations: vec![loc_dir(home.join(".continue"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".continue"), LocationType::HomeDir, ".continue")],
         },
         // 16. GitHub Copilot CLI (NEW)
         AgentConfig {
             key: "copilot".into(),
             display_name: "GitHub Copilot CLI".into(),
             category: AgentCategory::CliCoding,
-            locations: vec![loc_dir(home.join(".copilot"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".copilot"), LocationType::HomeDir, ".copilot")],
         },
         // 17. Zed (NEW)
         AgentConfig {
             key: "zed".into(),
             display_name: "Zed Editor".into(),
             category: AgentCategory::Ide,
-            locations: vec![loc_dir(home.join(".zed"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".zed"), LocationType::HomeDir, ".zed")],
         },
         // 18. Roo (NEW)
         AgentConfig {
             key: "roo".into(),
             display_name: "Roo Code".into(),
             category: AgentCategory::Ide,
-            locations: vec![loc_dir(home.join(".roo"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".roo"), LocationType::HomeDir, ".roo")],
         },
         // 19. Trae (NEW)
         AgentConfig {
             key: "trae".into(),
             display_name: "Trae".into(),
             category: AgentCategory::Ide,
-            locations: vec![loc_dir(home.join(".trae"), LocationType::HomeDir, ".")],
+            locations: vec![loc_dir(home.join(".trae"), LocationType::HomeDir, ".trae")],
         },
     ];
 
@@ -310,7 +310,7 @@ impl Registry {
                             path,
                             location_type: LocationType::Custom,
                             kind,
-                            backup_subdir: ".".into(),
+                            backup_subdir: format!(".{key}"),
                         }
                     })
                     .collect()

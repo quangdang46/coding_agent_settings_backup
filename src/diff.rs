@@ -12,7 +12,7 @@ use crate::restore::{build_preview, RestorePreview};
 
 /// Compute changes since the most recent backup commit.
 pub fn diff_since_last_backup(cfg: &Config, agent: &AgentConfig) -> Result<RestorePreview> {
-    let repo = require_repo(cfg, agent)?;
+    let repo = require_repo(cfg)?;
     if !repo.ref_exists("HEAD") {
         return Err(CasbError::NoBackupRepo {
             key: agent.key.clone(),
