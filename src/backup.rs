@@ -156,27 +156,19 @@ fn backup_one(
         run_hooks(HookKind::PreBackup, &agent.key)?;
     }
 
-    let stats = sync_agent_to_backup(
-        agent,
-        backup_root,
-        &filter,
-        cfg.backup.use_rsync,
-        dry_run,
-    )?;
+    let stats = sync_agent_to_backup(agent, backup_root, &filter, cfg.backup.use_rsync, dry_run)?;
 
     let mut committed = false;
     let mut commit = None;
     if !dry_run && cfg.general.auto_commit {
         repo.add_all()?;
-        let msg = message
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                format!(
-                    "casb backup {} at {}",
-                    agent.key,
-                    Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                )
-            });
+        let msg = message.map(|s| s.to_string()).unwrap_or_else(|| {
+            format!(
+                "casb backup {} at {}",
+                agent.key,
+                Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+            )
+        });
         committed = repo.commit(&msg)?;
         commit = repo.head_short()?;
     } else if !dry_run {
@@ -337,8 +329,7 @@ mod tests {
         // Initialize the single .git repo (done by backup_agents in real usage).
         let repo = Repo::new(backup_root.path());
         repo.init().unwrap();
-        let outcome =
-            backup_one(&cfg, &agent, backup_root.path(), Some("msg"), false).unwrap();
+        let outcome = backup_one(&cfg, &agent, backup_root.path(), Some("msg"), false).unwrap();
         assert!(outcome.installed);
         assert!(outcome.committed);
         // .git is at backup_root; file lands in .test1/ subdir.

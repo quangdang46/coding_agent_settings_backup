@@ -68,8 +68,8 @@ pub fn export_agent(
 
 fn write_tar<W: Write>(enc: GzEncoder<W>, repo_path: &Path, key: &str) -> Result<()> {
     let mut tar = tar::Builder::new(enc);
-    tar.append_dir_all(format!(".{key}"), &repo_path.join(format!(".{key}")))?;
-    tar.append_dir_all(".git", &repo_path.join(".git"))?;
+    tar.append_dir_all(format!(".{key}"), repo_path.join(format!(".{key}")))?;
+    tar.append_dir_all(".git", repo_path.join(".git"))?;
     let enc = tar.into_inner()?;
     enc.finish()?;
     Ok(())

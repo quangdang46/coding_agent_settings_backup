@@ -57,7 +57,11 @@ pub fn compute_stats(cfg: &Config, registry: &Registry, key: Option<&str>) -> Re
     let repo = Repo::new(&backup_root);
     let repo_exists = repo.exists();
     let repo_commits = if repo_exists { repo.commit_count()? } else { 0 };
-    let repo_bytes_total = if repo_exists { dir_size(&backup_root) } else { 0 };
+    let repo_bytes_total = if repo_exists {
+        dir_size(&backup_root)
+    } else {
+        0
+    };
 
     for agent in agents {
         let source_bytes: u64 = agent.installed_locations().map(|l| dir_size(&l.path)).sum();

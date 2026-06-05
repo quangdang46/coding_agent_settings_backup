@@ -17,7 +17,12 @@ pub struct TagEntry {
 }
 
 /// Create a tag at HEAD with optional annotated message.
-pub fn create_tag(cfg: &Config, _agent: &crate::agent::AgentConfig, name: &str, message: Option<&str>) -> Result<()> {
+pub fn create_tag(
+    cfg: &Config,
+    _agent: &crate::agent::AgentConfig,
+    name: &str,
+    message: Option<&str>,
+) -> Result<()> {
     let repo = require_repo(cfg)?;
     repo.tag_create(name, message)?;
     Ok(())

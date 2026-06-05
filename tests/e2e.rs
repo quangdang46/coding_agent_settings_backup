@@ -155,7 +155,10 @@ fn lifecycle_codex_single_location() {
         .success()
         .stdout(predicates::str::contains("codex_e2e"));
 
-    assert!(env.backup_root.join(".git").exists(), "shared repo must be initialised");
+    assert!(
+        env.backup_root.join(".git").exists(),
+        "shared repo must be initialised"
+    );
     assert!(env.backup_root.join(".codex_e2e/config.toml").exists());
 
     // History returns at least one entry.
@@ -445,7 +448,10 @@ fn portable_lifecycle_backup_and_restore() {
         .success()
         .stdout(predicates::str::contains("codex_p"));
 
-    assert!(env.backup_root.join(".git").exists(), "shared repo must be initialised");
+    assert!(
+        env.backup_root.join(".git").exists(),
+        "shared repo must be initialised"
+    );
 
     env.casb()
         .args(["history", "codex_p"])
