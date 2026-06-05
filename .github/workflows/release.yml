@@ -52,6 +52,7 @@ jobs:
         if: matrix.uses-cross
         run: cargo install cross
       - name: Build release
+        shell: bash
         run: |
           if [ "${{ matrix.uses-cross }}" = "true" ]; then
             cross build --release --target ${{ matrix.target }}
