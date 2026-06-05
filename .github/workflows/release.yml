@@ -64,31 +64,28 @@ jobs:
         run: |
           bin="target/${{ matrix.target }}/release/casb"
           [ "${{ matrix.runner }}" = "windows-latest" ] && bin="$bin.exe"
-          
+
           mkdir -p dist
           if [ "${{ matrix.runner }}" = "windows-latest" ]; then
             cp "$bin" dist/casb.exe
             cd dist
-            powershell -Command "Compress-Archive -Path casb.exe -DestinationPath ../casb-${{ matrix.suffix }}.zip -Force"
-            cd ..
-            rm dist/casb.exe
+            powershell -Command "Compress-Archive -Path casb.exe -DestinationPath casb-${{ matrix.suffix }}.zip -Force"
+            rm casb.exe
           else
             cp "$bin" dist/casb
             cd dist
-            tar -czf ../casb-${{ matrix.suffix }}.tar.gz casb
-            cd ..
-            rm dist/casb
+            tar -czf casb-${{ matrix.suffix }}.tar.gz casb
+            rm casb
           fi
       - name: Compute checksum
         shell: bash
+        working-directory: dist
         run: |
-          cd dist
           if [ "${{ matrix.runner }}" = "windows-latest" ]; then
             powershell -Command "(Get-FileHash -Path casb-${{ matrix.suffix }}.zip -Algorithm SHA256).Hash | ForEach-Object { $_ + '  casb-${{ matrix.suffix }}.zip' }" > casb-${{ matrix.suffix }}.zip.sha256
           else
             sha256sum casb-${{ matrix.suffix }}.tar.gz > casb-${{ matrix.suffix }}.tar.gz.sha256
           fi
-          cd ..
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
