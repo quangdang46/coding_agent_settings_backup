@@ -62,7 +62,7 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          bin="${{ matrix.target }}/release/casb"
+          bin="target/${{ matrix.target }}/release/casb"
           [ "${{ matrix.runner }}" = "windows-latest" ] && bin="$bin.exe"
           
           mkdir -p dist
