@@ -163,9 +163,14 @@ pub fn default_exclusions() -> Vec<String> {
         "**/file-history/**".into(),
         "**/backups/**".into(),
         "**/shell_snapshots/**".into(),
+        "**/shell-snapshots/**".into(),
         "**/shell_snapshot/**".into(),
         "**/telemetry/**".into(),
         "**/downloads/**".into(),
+        // Skills from marketplace (can be reinstalled)
+        "**/skills/**".into(),
+        // Plugin marketplace data (can be reinstalled)
+        "**/marketplaces/**".into(),
         // ── Codex specific ────────────────────────────────────────
         "**/packages/**".into(),
         "**/models_cache.json".into(),
@@ -176,6 +181,10 @@ pub fn default_exclusions() -> Vec<String> {
         "**/node_modules/**".into(),
         "**/package-lock.json".into(),
         "**/package.json".into(),
+        "**/snapshot/**".into(),
+        "**/tool-output/**".into(),
+        "*.db-shm".into(),
+        "*.db-wal".into(),
         // ── Python ────────────────────────────────────────────────
         "**/__pycache__/**".into(),
         "**/.venv/**".into(),
