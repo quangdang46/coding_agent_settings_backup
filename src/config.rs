@@ -201,6 +201,15 @@ pub fn default_exclusions() -> Vec<String> {
         "**/logs_*.sqlite*".into(),
         "**/memories_*.sqlite*".into(),
         "**/state_*.sqlite*".into(),
+        "**/data/versions/**".into(),
+        "**/dist/**".into(),
+        "**/target/**".into(),
+        "**/*.bin".into(),
+        "**/*.exe".into(),
+        "**/*.dll".into(),
+        "**/*.dylib".into(),
+        "**/*.so".into(),
+        "**/*.wasm".into(),
     ]
 }
 
