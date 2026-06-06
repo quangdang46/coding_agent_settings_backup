@@ -84,7 +84,7 @@ detect_platform() {
     local os arch
     case "$(uname -s)" in
         Linux*)  os="linux";;
-        Darwin*) os="darwin";;
+        Darwin*) os="macos";;
         MINGW*|MSYS*|CYGWIN*) os="windows";;
         *) die "Unsupported OS: $(uname -s)";;
     esac
@@ -93,7 +93,7 @@ detect_platform() {
         aarch64|arm64) arch="aarch64";;
         *) die "Unsupported arch: $(uname -m)";;
     esac
-    echo "${os}_${arch}"
+    echo "${os}-${arch}"
 }
 
 # === Version ===
@@ -165,7 +165,7 @@ main() {
     if [ "$FROM_SOURCE" -eq 0 ]; then
         resolve_version
         local ext="tar.gz"; [[ "$platform" == windows* ]] && ext="zip"
-        local archive="${BINARY_NAME}-${VERSION}-${platform}.${ext}"
+        local archive="${BINARY_NAME}-${platform}.${ext}"
         local url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive}"
 
         if download_file "$url" "$TMP/$archive"; then

@@ -184,7 +184,7 @@ try {
     Write-Info "Version: $ver"
     
     if (-not $FromSource) {
-        $archiveName = "casb-${ver}-windows-x86_64.zip"
+        $archiveName = "casb-windows-x86_64.zip"
         $downloadUrl = "https://github.com/${OWNER}/${REPO}/releases/download/${ver}/${archiveName}"
         $zipPath = Join-Path $TMP $archiveName
         
