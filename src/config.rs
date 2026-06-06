@@ -119,61 +119,79 @@ pub struct CustomAgentConfig {
 /// configuration data.
 pub fn default_exclusions() -> Vec<String> {
     vec![
-        // OS / editor junk
+        // ── OS / editor junk ──────────────────────────────────────
         ".DS_Store".into(),
         "Thumbs.db".into(),
-        // Temp / swap files
+        // ── Temp / swap files ─────────────────────────────────────
         "*.tmp".into(),
         "*.temp".into(),
         "*.swp".into(),
         "*~".into(),
         "*.bak".into(),
-        // Logs (often gigabytes in practice, e.g. Codex's codex-tui.log)
+        // ── Logs ──────────────────────────────────────────────────
         "*.log".into(),
         "**/log/**".into(),
         "**/logs/**".into(),
         "**/Log/**".into(),
-        // Cache directories
+        // ── Cache directories ─────────────────────────────────────
         "**/cache/**".into(),
         "**/Cache/**".into(),
         "**/.cache/**".into(),
         "**/paste-cache/**".into(),
-        // SQLite databases
+        // ── SQLite databases (state, not config) ──────────────────
         "*.sqlite".into(),
         "*.sqlite3".into(),
         "*.sqlite3-wal".into(),
         "*.sqlite3-shm".into(),
-        // Session / replay / timeline data (not configuration)
+        "*.sqlite-shm".into(),
+        "*.sqlite-wal".into(),
+        // ── Session / replay / timeline data ──────────────────────
         "**/sessions/**".into(),
         "**/logseq/**".into(),
         "**/history/**".into(),
         "**/history.jsonl".into(),
         "**/session_index.jsonl".into(),
         "**/files-history/**".into(),
-        // Claude Code specific (LARGE - not user config)
+        "**/session-env/**".into(),
+        // ── Claude Code specific (LARGE - not user config) ────────
         "**/projects/**".into(),
         "**/transcripts/**".into(),
         "**/plans/**".into(),
         "**/skill-learning/**".into(),
         "**/*.jsonl".into(),
         "**/tasks/**".into(),
-        // Memories (Codex etc - AI-generated summaries, not config)
-        "**/memories/**".into(),
-        // Shell snapshots
+        "**/file-history/**".into(),
+        "**/backups/**".into(),
         "**/shell_snapshots/**".into(),
         "**/shell_snapshot/**".into(),
-        // Downloads (if any exist in agent dirs)
+        "**/telemetry/**".into(),
         "**/downloads/**".into(),
-        // Python/JS dependencies (never config)
+        // ── Codex specific ────────────────────────────────────────
+        "**/packages/**".into(),
+        "**/models_cache.json".into(),
+        "**/vendor_imports/**".into(),
+        "**/computer-use/**".into(),
+        "**/.tmp/**".into(),
+        // ── OpenCode specific ─────────────────────────────────────
         "**/node_modules/**".into(),
+        "**/package-lock.json".into(),
+        "**/package.json".into(),
+        // ── Python ────────────────────────────────────────────────
         "**/__pycache__/**".into(),
         "**/.venv/**".into(),
         "**/venv/**".into(),
-        // Blob storage directories (OpenCode etc)
+        // ── Blob storage (OpenCode etc) ───────────────────────────
         "**/storage/**".into(),
-        // Agent temp / workdirs
+        // ── Agent temp / workdirs ─────────────────────────────────
         "**/tmp/**".into(),
         "**/temp/**".into(),
+        // ── Large binary / generated files ────────────────────────
+        "*.sqlite".into(),
+        "*.db".into(),
+        "**/goals_*.sqlite*".into(),
+        "**/logs_*.sqlite*".into(),
+        "**/memories_*.sqlite*".into(),
+        "**/state_*.sqlite*".into(),
     ]
 }
 
