@@ -67,11 +67,33 @@ pub fn export_agent(
 }
 
 fn write_tar<W: Write>(enc: GzEncoder<W>, repo_path: &Path, key: &str) -> Result<()> {
+    let agent_dir = format!(".{key}");
+    // If the agent directory exists on disk, use it directly.
+    // Otherwise, restore from git first (the backup commit removed the
+    // working tree to save disk space).
+    let need_cleanup = if repo_path.join(&agent_dir).exists() {
+        false
+    } else {
+        // Restore agent directory from git HEAD.
+        std::process::Command::new("git")
+            .current_dir(repo_path)
+            .args(["checkout", "HEAD", "--", &agent_dir])
+            .output()?;
+        true
+    };
     let mut tar = tar::Builder::new(enc);
-    tar.append_dir_all(format!(".{key}"), repo_path.join(format!(".{key}")))?;
-    tar.append_dir_all(".git", repo_path.join(".git"))?;
+    if repo_path.join(&agent_dir).exists() {
+        tar.append_dir_all(&agent_dir, repo_path.join(&agent_dir))?;
+    }
+    if repo_path.join(".git").exists() {
+        tar.append_dir_all(".git", repo_path.join(".git"))?;
+    }
     let enc = tar.into_inner()?;
     enc.finish()?;
+    // Clean up restored directory if we created it.
+    if need_cleanup {
+        let _ = std::fs::remove_dir_all(repo_path.join(&agent_dir));
+    }
     Ok(())
 }
 
