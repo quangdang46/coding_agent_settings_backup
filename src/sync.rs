@@ -326,6 +326,38 @@ fn sync_walkdir(
     Ok(stats)
 }
 
+/// Count files tracked by git for a specific agent subdirectory.
+/// This gives the accurate count after gitignore exclusions are applied.
+pub fn count_git_tracked(repo_path: &Path, agent_subdir: &str) -> Result<SyncStats> {
+    let out = std::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["ls-files", agent_subdir])
+        .output()?;
+    if !out.status.success() {
+        return Ok(SyncStats::default());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let files_copied = stdout.lines().filter(|l| !l.trim().is_empty()).count();
+    let bytes_copied = if files_copied > 0 {
+        // Estimate size from the files listed
+        let mut total = 0u64;
+        for line in stdout.lines() {
+            let path = repo_path.join(line.trim());
+            if let Ok(meta) = std::fs::metadata(&path) {
+                total += meta.len();
+            }
+        }
+        total
+    } else {
+        0
+    };
+    Ok(SyncStats {
+        files_copied,
+        bytes_copied,
+        ..Default::default()
+    })
+}
+
 /// Remove files/dirs under `root` that don't appear in `kept` (relative
 /// paths). `.git` is always preserved.
 fn prune_unknown(root: &Path, cur: &Path, kept: &std::collections::HashSet<PathBuf>) -> Result<()> {

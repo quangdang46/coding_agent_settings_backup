@@ -156,7 +156,7 @@ fn backup_one(
         run_hooks(HookKind::PreBackup, &agent.key)?;
     }
 
-    let stats = sync_agent_to_backup(agent, backup_root, &filter, cfg.backup.use_rsync, dry_run)?;
+    let _stats = sync_agent_to_backup(agent, backup_root, &filter, cfg.backup.use_rsync, dry_run)?;
 
     let mut committed = false;
     let mut commit = None;
@@ -175,6 +175,14 @@ fn backup_one(
         repo.add_all()?;
         commit = repo.head_short()?;
     }
+
+    // Count files actually tracked by git (after exclusions), not the
+    // temporary rsync count which includes files that gitignore drops.
+    let stats = if !dry_run && commit.is_some() {
+        crate::sync::count_git_tracked(backup_root, &agent.locations[0].backup_subdir)?
+    } else {
+        _stats
+    };
 
     if !dry_run {
         run_hooks(HookKind::PostBackup, &agent.key)?;
