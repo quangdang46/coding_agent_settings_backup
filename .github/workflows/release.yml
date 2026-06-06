@@ -82,7 +82,7 @@ jobs:
         working-directory: dist
         run: |
           if [ "${{ matrix.runner }}" = "windows-latest" ]; then
-            powershell -Command "(Get-FileHash -Path casb-${{ matrix.suffix }}.zip -Algorithm SHA256).Hash | ForEach-Object { $_ + '  casb-${{ matrix.suffix }}.zip' }" > casb-${{ matrix.suffix }}.zip.sha256
+            sha256sum casb-${{ matrix.suffix }}.zip > casb-${{ matrix.suffix }}.zip.sha256
           else
             sha256sum casb-${{ matrix.suffix }}.tar.gz > casb-${{ matrix.suffix }}.tar.gz.sha256
           fi
@@ -96,6 +96,8 @@ jobs:
     name: Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -103,11 +105,16 @@ jobs:
           path: artifacts
           pattern: 'casb-*'
           merge-multiple: true
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: 'artifacts/*'
-          generate_release_notes: true
+      - name: List artifacts
+        run: find artifacts -type f | sort
+      - name: Create GitHub Release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --generate-notes \
+            --verify-tag \
+            $(find artifacts -type f | sort)
 
