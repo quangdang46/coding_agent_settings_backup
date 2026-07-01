@@ -176,7 +176,7 @@ fn backup_one(
         // refused to track — keeps backup root lean (~MB not GB).
         if std::env::var("CASB_DEBUG_CLEAN").is_ok() {
             let out = std::process::Command::new("git")
-                .current_dir(&backup_root)
+                .current_dir(backup_root)
                 .args(["clean", "-fdX", "-n"])
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
