@@ -279,6 +279,15 @@ impl Repo {
         Ok(())
     }
 
+    /// Remove all files tracked by `.gitignore` from the working tree but
+    /// keep them in git history. Prevents rsync-copied, gitignore-excluded
+    /// binaries (packages/, plugins/, computer-use/, etc.) from wasting
+    /// disk space.
+    pub fn clean_ignored(&self) -> Result<()> {
+        let _ = run_git_in(&self.path, &["clean", "-fdX"]);
+        Ok(())
+    }
+
     /// Path to a temporary worktree at the given ref. Caller must
     /// `worktree_remove` afterwards.
     pub fn worktree_add(&self, target: &Path, refname: &str) -> Result<()> {

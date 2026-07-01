@@ -171,6 +171,19 @@ fn backup_one(
         });
         committed = repo.commit(&msg)?;
         commit = repo.head_short()?;
+        // Remove files excluded by .gitignore from disk (packages/,
+        // plugins/, computer-use/) that rsync may have copied but git
+        // refused to track — keeps backup root lean (~MB not GB).
+        if std::env::var("CASB_DEBUG_CLEAN").is_ok() {
+            let out = std::process::Command::new("git")
+                .current_dir(&backup_root)
+                .args(["clean", "-fdX", "-n"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            eprintln!("[clean DEBUG] would remove:\n{}", out);
+        }
+        repo.clean_ignored()?;
     } else if !dry_run {
         repo.add_all()?;
         commit = repo.head_short()?;

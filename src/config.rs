@@ -155,6 +155,7 @@ pub fn default_exclusions() -> Vec<String> {
         "**/session-env/**".into(),
         // ── Claude Code specific (LARGE - not user config) ────────
         "**/projects/**".into(),
+        "projects/".into(), // rsync-compatible variant
         "**/transcripts/**".into(),
         "**/plans/**".into(),
         "**/skill-learning/**".into(),
@@ -173,10 +174,15 @@ pub fn default_exclusions() -> Vec<String> {
         "**/marketplaces/**".into(),
         // ── Codex specific ────────────────────────────────────────
         "**/packages/**".into(),
+        "packages/".into(), // rsync-compatible variant
         "**/models_cache.json".into(),
         "**/vendor_imports/**".into(),
         "**/computer-use/**".into(),
+        "computer-use/".into(), // rsync-compatible variant
         "**/.tmp/**".into(),
+        // ── Cursor specific (reinstallable skills) ────────────────
+        "**/skills-cursor/**".into(),
+        "skills-cursor/".into(), // rsync-compatible variant
         // ── OpenCode specific ─────────────────────────────────────
         "**/node_modules/**".into(),
         "**/package-lock.json".into(),
@@ -194,6 +200,9 @@ pub fn default_exclusions() -> Vec<String> {
         // ── Agent temp / workdirs ─────────────────────────────────
         "**/tmp/**".into(),
         "**/temp/**".into(),
+        // ── Agent runtime / binary artifacts ──────────────────────
+        "**/plugins/**".into(),
+        "plugins/".into(), // rsync-compatible variant
         // ── Large binary / generated files ────────────────────────
         "*.sqlite".into(),
         "*.db".into(),

@@ -48,7 +48,6 @@ pub fn compute_stats(cfg: &Config, registry: &Registry, key: Option<&str>) -> Re
     };
 
     let mut entries = Vec::new();
-    let mut total_repo = 0u64;
     let mut total_source = 0u64;
     let mut total_commits = 0u64;
 
@@ -57,7 +56,9 @@ pub fn compute_stats(cfg: &Config, registry: &Registry, key: Option<&str>) -> Re
     let repo = Repo::new(&backup_root);
     let repo_exists = repo.exists();
     let repo_commits = if repo_exists { repo.commit_count()? } else { 0 };
-    let repo_bytes_total = if repo_exists {
+    // Actual on-disk size of the entire backup root (including .git + all agent
+    // subdirs). Used as the single `total_repo_bytes`.
+    let total_repo_bytes = if repo_exists {
         dir_size(&backup_root)
     } else {
         0
@@ -65,9 +66,18 @@ pub fn compute_stats(cfg: &Config, registry: &Registry, key: Option<&str>) -> Re
 
     for agent in agents {
         let source_bytes: u64 = agent.installed_locations().map(|l| dir_size(&l.path)).sum();
-        // Each agent's backup content lives in its subdirs; size is the whole
-        // repo since all agents share one .git (shown as repo_bytes for each).
-        total_repo += repo_bytes_total;
+        // Per-agent: size of its data subdir(s) inside the backup root only.
+        let agent_repo_bytes: u64 = agent
+            .installed_locations()
+            .map(|l| {
+                let sub = backup_root.join(&l.backup_subdir);
+                if sub.exists() {
+                    dir_size(&sub)
+                } else {
+                    0
+                }
+            })
+            .sum();
         total_source += source_bytes;
         total_commits += repo_commits;
         entries.push(AgentStats {
@@ -75,14 +85,14 @@ pub fn compute_stats(cfg: &Config, registry: &Registry, key: Option<&str>) -> Re
             installed: agent.is_installed(),
             repo_exists,
             commits: repo_commits,
-            repo_bytes: repo_bytes_total,
+            repo_bytes: agent_repo_bytes,
             source_bytes,
         });
     }
 
     Ok(Stats {
         agents: entries,
-        total_repo_bytes: total_repo,
+        total_repo_bytes,
         total_source_bytes: total_source,
         total_commits,
     })

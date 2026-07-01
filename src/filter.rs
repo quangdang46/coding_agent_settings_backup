@@ -102,8 +102,17 @@ impl ExclusionFilter {
             require_literal_separator: false,
             require_literal_leading_dot: false,
         };
+        // Track which pattern matched for debugging.
         for pat in &self.patterns {
             if pat.matches_with(&path_str, opts) || pat.matches_with(&basename, opts) {
+                if std::env::var("CASB_DEBUG_EXCLUDE").is_ok() {
+                    eprintln!(
+                        "[exclude DEBUG] '{}' matched path/basename '{}' with pattern '{}'",
+                        rel_path.display(),
+                        path_str,
+                        pat
+                    );
+                }
                 return true;
             }
             // For ** trailing patterns like `**/cache/**`, match if any
@@ -111,6 +120,14 @@ impl ExclusionFilter {
             for component in rel_path.components() {
                 let cs = component.as_os_str().to_string_lossy();
                 if pat.matches_with(&cs, opts) {
+                    if std::env::var("CASB_DEBUG_EXCLUDE").is_ok() {
+                        eprintln!(
+                            "[exclude DEBUG] '{}' matched component '{}' with pattern '{}'",
+                            rel_path.display(),
+                            cs,
+                            pat
+                        );
+                    }
                     return true;
                 }
             }

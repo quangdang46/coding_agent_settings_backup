@@ -231,6 +231,12 @@ fn sync_rsync(
     // source) and subsequent git operations will fail.
     args.push("--exclude".to_string());
     args.push(".git".to_string());
+    // Do not copy the source's own .gitignore into the backup tree: each
+    // agent source may have a .gitignore that ignores everything ("*") which
+    // would cause `git add -A` to miss those files, then `git clean -fdX`
+    // would delete them. The backup repo already manages its own .gitignore.
+    args.push("--exclude".to_string());
+    args.push(".gitignore".to_string());
     for pat in filter.raw_patterns() {
         args.push("--exclude".to_string());
         args.push(pat.clone());
@@ -239,6 +245,14 @@ fn sync_rsync(
     let dest_arg = format!("{}/", dest.display());
     args.push(src_arg);
     args.push(dest_arg);
+
+    if std::env::var("CASB_DEBUG_RSYNC").is_ok() {
+        eprintln!(
+            "[rsync DEBUG] cd {} && rsync {}",
+            dest.parent().unwrap_or(dest).display(),
+            args.join(" ")
+        );
+    }
 
     let out = Command::new("rsync").args(&args).output()?;
     if !out.status.success() {
@@ -285,7 +299,10 @@ fn sync_walkdir(
             // `.git` (the backup repo metadata); pulling one in from the
             // source produces gitlinks/EISDIR errors on the next backup.
             // Mirrors the `--exclude .git` we already pass to rsync.
-            e.path() == src || e.file_name() != ".git"
+            //
+            // Also skip `.gitignore` from source — the backup repo manages
+            // its own `.gitignore` and source .gitignore may break git-add.
+            e.path() == src || (e.file_name() != ".git" && e.file_name() != ".gitignore")
         })
         .filter_map(|e| e.ok())
     {
@@ -321,6 +338,13 @@ fn sync_walkdir(
     }
 
     if !dry_run && dest.exists() {
+        if std::env::var("CASB_DEBUG_PRUNE").is_ok() {
+            eprintln!(
+                "[prune DEBUG] pruning {} (kept {} paths)",
+                dest.display(),
+                kept.len()
+            );
+        }
         prune_unknown(dest, dest, &kept)?;
     }
     Ok(stats)
