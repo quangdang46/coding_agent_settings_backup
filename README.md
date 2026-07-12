@@ -1,222 +1,256 @@
+# casb — Coding Agent Settings Backup
+
 <div align="center">
-  <img src="coding_agent_settings_backup_illustration.webp" alt="casb — back up and restore AI coding agent settings" width="720">
+  <img src="coding_agent_settings_backup_illustration.webp" alt="casb — back up and restore AI coding agent settings">
 </div>
 
 <div align="center">
 
-# `casb` — Coding Agent Settings Backup
-
-Back up, version, and restore AI coding agent configs — in Rust.
-
-[![License: MIT](https://img.shields.io/github/license/quangdang46/coding_agent_settings_backup?style=for-the-badge)](LICENSE)
-[![GitHub Release](https://img.shields.io/github/v/release/quangdang46/coding_agent_settings_backup?style=for-the-badge)](https://github.com/quangdang46/coding_agent_settings_backup/releases)
-[![CI](https://img.shields.io/github/actions/workflow/status/quangdang46/coding_agent_settings_backup/ci.yml?style=for-the-badge)](https://github.com/quangdang46/coding_agent_settings_backup/actions)
-[![GitHub Stars](https://img.shields.io/github/stars/quangdang46/coding_agent_settings_backup?style=for-the-badge)](https://github.com/quangdang46/coding_agent_settings_backup/stargazers)
+![License](https://img.shields.io/github/license/quangdang46/coding_agent_settings_backup?style=for-the-badge)
+![Release](https://img.shields.io/github/v/release/quangdang46/coding_agent_settings_backup?style=for-the-badge)
+![CI](https://img.shields.io/github/actions/workflow/status/quangdang46/coding_agent_settings_backup/ci.yml?style=for-the-badge)
+![Rust](https://img.shields.io/badge/Rust-stable-orange?style=for-the-badge)
 
 </div>
 
-## What is this?
+**Back up, version, and restore configuration for 19 AI coding agents — in Rust.**  
+Claude Code, Codex, Cursor, Gemini, OpenCode, and 14 more. One shared git repo, `--json` for agents, full version history.
 
-`casb` is a CLI that backs up, snapshots, and restores configuration folders for AI coding agents — Claude Code, Codex, Cursor, Gemini, OpenCode, and 14 more. Each agent gets a **single shared git repository** under `~/.agent_settings_backups/`, giving you full version history, diff, tags, and restore on any agent's settings.
+<div align="center">
 
-It is a feature-complete, type-safe Rust port of the [`asb`](https://github.com/quangdang46/agent_settings_backup_script) bash script with first-class multi-location agent support, SQLite state backup, parallel operations, and a `doctor` health-check command.
+```bash
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/install.sh?$(date +%s)" \
+  | bash -s -- --easy-mode
+```
 
-## Quick Start
+</div>
 
-```sh
-# Install via curl | bash (Linux / macOS)
-curl -fsSL "https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/install.sh" | bash
+---
 
-# Or from source
-cargo install --git https://github.com/quangdang46/coding_agent_settings_backup --locked
+## 🤖 Agent Quickstart (Robot Mode)
 
-# Initialize backup root
+⚠️ Always use `--json` in agent contexts. Never scrape human text output.
+
+```bash
+# Snapshot all installed agents
+casb backup --json
+
+# See backup state (installed, backed up, missing)
+casb list --json
+
+# Restore a specific agent
+casb restore claude --json
+
+# Health check
+casb doctor --json
+```
+
+**Output conventions**
+- stdout = structured data (JSON)
+- stderr = diagnostics, warnings
+- exit 0 = success, exit 1 = errors found
+
+---
+
+## TL;DR
+
+### The Problem
+
+Every coding agent stores its configuration somewhere different. Claude Code uses 3 directories, Codex and Gemini use their own, OpenCode has 2, and each one gets lost when you reinstall or migrate machines. Six months of agent tuning — custom instructions, provider keys, tool preferences — disappears in a format-and-reinstall.
+
+Manual backups are inconsistent. Per-agent `.git` folders sprawl. And when something breaks, you have no idea which backup contains the config you need.
+
+### The Solution
+
+`casb` discovers every installed AI agent on your machine, backs up all their config directories into a **single shared git repository**, and gives you tags, history, diff, and restore — from one CLI. Nineteen agents supported out of the box, multi-location merging for agents with scattered config dirs, and SQLite state databases included.
+
+### Why casb?
+
+| Feature | What it does |
+|---------|--------------|
+| **19 agents, one repo** | Claude, Codex, Cursor, Gemini, OpenCode, Cline, Aider, Copilot, and 11 more — all under `~/.agent_settings_backups/.git` |
+| **Multi-location merge** | Agents with 2–3 config dirs get merged into a single backup commit |
+| **Machine-readable** | `--json` and `--format toon` for coding agents |
+| **Parallel backup** | `casb backup --parallel` runs agents concurrently |
+| **Diff & history** | See what changed per agent between backups |
+| **Export / Import** | `tar.gz` archives with stdin/stdout pipe for migrations |
+| **Doctor** | Health checks for git, rsync, disk, config, and per-repo `git fsck` |
+| **Schedule** | `systemd` timers or `cron` — automated daily/weekly |
+| **Shell completion** | bash, zsh, fish |
+| **No `git2` / no `libgit2`** | Pure `std::process::Command` — ~2.9 MB binary, fast compile |
+
+### How casb Compares
+
+| Capability | casb | Manual tar/cp | Per-agent git repos | Cloud sync (iCloud, rsync) |
+|-----------|------|--------------|---------------------|---------------------------|
+| **Agents auto-detected** | ✅ 19 built-in | ❌ Manual list | ❌ Per-agent setup | ❌ All-or-nothing |
+| **Shared git repo** | ✅ Single `.git` | ❌ Per-folder | ❌ Per-agent `.git` sprawl | ❌ Not versioned |
+| **Multi-location merge** | ✅ Claude=3 dirs merged | ❌ Manual merge | ❌ Split repos | ❌ Split folders |
+| **Diff per agent** | ✅ `casb diff` | ❌ Manual | ✅ Per-repo | ❌ |
+| **Export pipe** | ✅ stdin/stdout `tar.gz` | ✅ tar czf | ❌ | ❌ |
+| **JSON output** | ✅ `--json` | ❌ | ❌ | ❌ |
+| **Binary size** | ~2.9 MB | N/A | ~50 MB+ with git2 | N/A |
+
+---
+
+## Quick Example
+
+```bash
+# One-time setup
 casb init
 
-# Back up all installed agents
-casb backup
+# Back up everything
+casb backup                    # all 19 agents
+casb backup claude codex       # specific agents only
+casb backup --parallel         # concurrent
 
-# See what agents are detected and their backup status
+# See what's installed and backed up
 casb list
+casb history claude
+casb diff claude
 
-# Restore a specific agent from the latest backup
-casb restore claude
+# Restore
+casb restore claude            # latest backup
+casb restore claude v1.0       # tagged backup
+
+# Machine-readable
+casb list --json
+casb doctor --json
+
+# Migrate machines
+casb export claude - | ssh new-machine "casb import -"
 ```
 
-See [full CLI reference](#usage) below for all commands.
+---
 
-## Features
+## Design Philosophy
 
-- **19 built-in agents**: claude, codex, cursor, gemini, cline, amp, aider, opencode, factory, windsurf, plandex, qwencode, amazonq, kiro, continue, copilot, zed, roo, trae.
-- **Multi-location support**: Agents with multiple config dirs (Claude: 3 locations, OpenCode: 2) are merged into a single backup repo.
-- **Single shared git repository** at `~/.agent_settings_backups/.git` — no per-agent `.git` sprawl.
-- **Smart filtering**: Sensible defaults plus per-agent `.casbignore`.
-- **SQLite state databases are backed up** — only `*.sqlite3-wal` / `*.sqlite3-shm` temp files excluded.
-- **Multiple output formats**: `text` (default), `--json`, `--format toon`.
-- **Parallel backup**: `casb backup --parallel` runs agent backups concurrently.
-- **Automation**: Schedule via `systemd` user timers or `cron`; pre/post backup/restore hooks.
-- **Export / Import**: `tar.gz` archives with stdin/stdout pipe support.
-- **Discovery**: `casb discover` scans `$HOME` for new dot-directories that look like AI agent configs.
-- **Doctor**: `casb doctor` runs a battery of health checks (git, rsync, disk space, config validity, per-repo `git fsck`).
-- **Shell completion**: bash, zsh, fish.
-- **No `git2` / no `libgit2` / no `nix`**: uses `std::process::Command` — ~2.9 MB binary, fast compile, cross-platform.
+| Principle | Rationale |
+|-----------|-----------|
+| **One repo to rule them all** | A single shared git repository eliminates per-agent `.git` sprawl and makes cross-agent restores atomic |
+| **Auto-discovery over config** | Nineteen agents detected automatically; no manual `settings.json` |
+| **Machine-readable first** | `--json` and `--format toon` so agents can inspect backup state without scraping |
+| **Safe by default** | `--dry-run`, `--force`, atomic writes, backup verification, pre/post hooks |
+| **No heavy dependencies** | `std::process::Command` for git — no `git2`/`libgit2`, ~2.9 MB binary |
 
-## Usage
+---
 
+## Installation
+
+```bash
+# macOS / Linux — curl pipe
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/install.sh?$(date +%s)" | bash
+
+# Windows PowerShell
+irm "https://raw.githubusercontent.com/quangdang46/coding_agent_settings_backup/main/install.ps1" | iex
+
+# From source
+cargo install --git https://github.com/quangdang46/coding_agent_settings_backup --locked
 ```
-casb [OPTIONS] <COMMAND>
-```
 
-**Global flags:**
+---
 
-| Flag | Purpose |
-|------|---------|
-| `-n`, `--dry-run` | Show what would happen without making changes |
-| `-f`, `--force` | Skip confirmation prompts |
-| `-v`, `--verbose` | Detailed output (enables `tracing` debug) |
-| `-q`, `--quiet` | Suppress non-error output |
-| `--json` | Machine-readable JSON envelope |
-| `--format <FMT>` | `text` (default), `json`, or `toon` |
-| `--config <PATH>` | Override config file path |
-
-**Commands:**
+## Commands
 
 | Command | Description |
 |---------|-------------|
-| `init` | Initialize the backup root directory |
-| `backup [AGENTS...]` | Back up one or more agents (all if none specified) |
-| `restore <AGENT> [REF]` | Restore from a backup commit or tag |
-| `export <AGENT> [FILE]` | Export an agent backup as `tar.gz` (`-` for stdout) |
-| `import [FILE]` | Import from a `tar.gz` archive (`-` for stdin) |
-| `list` | Show every agent and which are installed |
-| `history <AGENT>` | Show backup history for an agent |
-| `diff <AGENT>` | Show changes since the latest backup |
-| `tag <create\|list\|delete> <AGENT> <NAME>` | Manage backup tags |
-| `verify [AGENTS...]` | Run `git fsck` across backup repos |
+| `init` | Initialize backup root directory |
+| `backup [AGENTS...]` | Back up one or more agents (all if unspecified) |
+| `restore <AGENT> [REF]` | Restore from backup commit or tag |
+| `export <AGENT> [FILE]` | Export as `tar.gz` (`-` for stdout) |
+| `import [FILE]` | Import from `tar.gz` (`-` for stdin) |
+| `list` | Show every agent and install status |
+| `history <AGENT>` | Backup history for an agent |
+| `diff <AGENT>` | Changes since latest backup |
+| `tag` | Manage backup tags (create/list/delete) |
+| `verify [AGENTS...]` | `git fsck` integrity checks |
 | `stats [AGENT]` | Repo size, commit count, source size |
 | `discover` | Scan for newly installed AI agents |
 | `schedule` | Manage automated backup schedules |
 | `hooks` | List configured hook scripts |
 | `config` | Get/set configuration values |
-| `doctor` | Run health checks against the casb installation |
-| `completion <SHELL>` | Generate shell completion (bash, zsh, fish) |
+| `doctor` | Health check diagnostics |
+| `completion <SHELL>` | Generate shell completion (bash/zsh/fish) |
+
+### Supported agents (19 built-in)
+
+`claude` `codex` `cursor` `gemini` `cline` `amp` `aider` `opencode` `factory` `windsurf` `plandex` `qwencode` `amazonq` `kiro` `continue` `copilot` `zed` `roo` `trae`
+
+---
 
 ## Configuration
-
-Default location: `~/.config/casb/config.toml` (override with `CASB_CONFIG` or `--config`).
 
 ```toml
 [general]
 backup_root = "~/.agent_settings_backups"
 auto_commit = true
-verbose = false
-quiet = false
 output_format = "text"
 
 [backup]
-exclusions = [
-    "*.log", "*.tmp", "*.temp", "*.swp", "*~",
-    ".DS_Store", "Thumbs.db",
-    "**/cache/**", "**/Cache/**", "**/.cache/**",
-    "*.sqlite3-wal", "*.sqlite3-shm",
-    "**/paste-cache/**",
-]
-use_rsync = true         # falls back to pure-Rust walker if rsync absent
+exclusions = ["*.log", "*.tmp", "**/cache/**", "*.sqlite3-wal*"]
+use_rsync = true
 checksum_verify = false
 
 [schedule]
-method = "systemd"       # systemd | cron | none
-interval = "daily"       # hourly | daily | weekly
-
-# Custom agent overrides
-[agents.myagent]
-enabled = true
-display_name = "My Agent"
-locations = ["~/.myagent/"]
-exclusions = []
+method = "systemd"    # systemd | cron | none
+interval = "daily"    # hourly | daily | weekly
 ```
 
-**Environment overrides:**
-
-| Variable | Maps to |
-|----------|---------|
+| Env var | Maps to |
+|---------|---------|
 | `CASB_BACKUP_ROOT` | `general.backup_root` |
-| `CASB_AUTO_COMMIT` | `general.auto_commit` |
-| `CASB_VERBOSE` | `general.verbose` |
 | `CASB_OUTPUT_FORMAT` | `general.output_format` |
-| `CASB_CONFIG` | Config file path itself |
+| `CASB_CONFIG` | Config file path override |
 
-## Project Structure
+---
 
-```
-scripts/
-├── check_features.sh         # Validate featured-matrix completeness
-└── generate_mock_agents.sh   # Create mock agent layouts for E2E tests
-src/
-├── main.rs                   # Entry point, tracing setup
-├── lib.rs                    # Public API re-exports
-├── cli.rs                    # clap derive CLI definitions
-├── commands.rs               # Command dispatch logic
-├── config.rs                 # TOML config loading + env var overrides
-├── agent.rs                  # Agent definitions, discovery
-├── backup.rs                 # Backup orchestration (sync + git + commit)
-├── restore.rs                # Restore with preview + confirm
-├── export.rs                 # tar.gz export / import
-├── history.rs                # Git log / tag history
-├── diff.rs                   # Current-vs-backup comparison
-├── verify.rs                 # git fsck integrity checks
-├── stats.rs                  # Backup statistics
-├── schedule.rs               # cron / systemd scheduling
-├── hooks.rs                  # Pre/post hook execution
-├── completion.rs             # Shell completion generators
-├── output.rs                 # text / JSON / TOON formatters
-├── filter.rs                 # Exclusion / ignore rules
-├── doctor.rs                 # Health check diagnostics
-├── tag.rs                    # Git tag management
-├── sync.rs                   # rsync / cp file sync
-├── discover.rs               # Agent detection scanner
-├── util.rs                   # Shared helpers
-├── error.rs                  # Structured error types
-└── toon.rs                   # TOON format rendering
-tests/
-└── e2e.rs                    # End-to-end integration tests
-```
+## Troubleshooting
 
-## Documentation
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `casb backup` finds no agents | Agents not installed in standard paths | Run `casb discover` to scan custom locations |
+| `restore` fails with "repo not found" | `init` not run yet | `casb init` first |
+| `doctor` reports git errors | Backup repo corrupted | `casb verify --fix` or delete `.agent_settings_backups` and re-init |
+| Parallel backup slow | Too many agents + I/O contention | Reduce count with specific agent names |
+| Export pipe breaks | Stdout consumed by non-pipe context | Use `casb export agent file.tar.gz` for file output |
 
-| Resource | Description |
-|----------|-------------|
-| [Plan & Architecture](PLAN.md) | Full architecture document with agent definitions, data flow, and phase breakdown |
-| [Install Script](install.sh) | `curl | bash` installer — Linux / macOS |
-| [PowerShell Installer](install.ps1) | `irm | iex` installer — Windows |
-| [CI Workflow](.github/workflows/ci.yml) | GitHub Actions — build, test, clippy |
-| [Release Workflow](.github/workflows/release.yml) | GitHub Actions — cross-platform release |
-| [Feature Check Script](scripts/check_features.sh) | Validate all features against the spec |
-| [Mock Agent Generator](scripts/generate_mock_agents.sh) | Generate test fixtures for E2E tests |
+---
 
-## Contributing
+## Limitations
 
-PRs and issues are welcome. The project follows standard Rust conventions:
+| Edge case | Reality |
+|-----------|---------|
+| **Agent coverage** | 19 built-in agents — not every CLI tool on earth. `discover` helps find custom ones |
+| **No cloud sync** | casb is local-first. Export/import for migration; no built-in push to S3/Backblaze |
+| **git required** | Relies on `git` in PATH. If git is absent, backup falls back to file copy (no versioning) |
+| **SQLite WAL exclusion** | `*.sqlite3-wal` / `*.sqlite3-shm` are excluded — they are temp files, not the DB itself |
 
-```sh
-cargo build --release       # ~2.9 MB binary
-cargo test                  # unit + E2E tests
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all
-```
+---
 
-<a href="https://github.com/quangdang46/coding_agent_settings_backup/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=quangdang46/coding_agent_settings_backup" />
-</a>
+## FAQ
 
-## License
+### Does casb back up API keys?
 
-MIT — see [LICENSE](LICENSE).
+It backs up whatever is in the agent's config directory. If keys are in config files (not env vars), they get backed up. Use `.casbignore` to exclude sensitive paths.
+
+### Can I restore to a different machine?
+
+Yes — `casb export agent - | ssh new "casb import -"`. The target machine doesn't need the same agents installed for import.
+
+### What if an agent has config in 3 directories?
+
+casb merges all locations into one backup commit per agent. Supported multi-location agents: Claude (3), OpenCode (2), Cline (2).
+
+### Does casb work without git?
+
+It degrades gracefully — backup falls back to file copy with no version history. All other commands warn that git is missing.
+
+### How often should I run it?
+
+Daily via `casb schedule`. Or hook it into your shell's `precmd` / `zsh_prompt` for per-session backups.
 
 ---
 
 <div align="center">
-
-[![Star History Chart](https://api.star-history.com/svg?repos=quangdang46/coding_agent_settings_backup&type=Date)](https://star-history.com/#quangdang46/coding_agent_settings_backup&Date)
-
+  <sub>Built with Rust. Powered by Git. Backed up daily.</sub>
 </div>
