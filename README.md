@@ -1,4 +1,8 @@
 <div align="center">
+  <img src="coding_agent_settings_backup_illustration.webp" alt="casb — back up and restore AI coding agent settings" width="720">
+</div>
+
+<div align="center">
 
 # `casb` — Coding Agent Settings Backup
 
