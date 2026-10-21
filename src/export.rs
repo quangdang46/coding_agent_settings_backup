@@ -82,6 +82,11 @@ fn write_tar<W: Write>(enc: GzEncoder<W>, repo_path: &Path, key: &str) -> Result
         true
     };
     let mut tar = tar::Builder::new(enc);
+    // Store symlinks as symlinks rather than following them. Agent
+    // directories routinely contain "latest" pointers to files that have
+    // since been rotated away; following those dangling links makes tar
+    // fail with "No such file or directory" and aborts the whole export.
+    tar.follow_symlinks(false);
     if repo_path.join(&agent_dir).exists() {
         tar.append_dir_all(&agent_dir, repo_path.join(&agent_dir))?;
     }
@@ -200,5 +205,50 @@ mod tests {
         let reg = Registry::from_config(&Config::default()).unwrap();
         let res = export_agent(&cfg, &reg, "no-such-agent", None);
         assert!(res.is_err());
+    }
+
+    /// Regression: agent directories contain "latest" pointers to files that
+    /// have been rotated away. Following those dangling symlinks made tar
+    /// fail with "No such file or directory" and aborted the whole export.
+    #[cfg(unix)]
+    #[test]
+    fn export_survives_broken_symlink() {
+        let backup_root = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::write(src.path().join("settings.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(
+            src.path().join("rotated-away.txt"),
+            src.path().join("latest"),
+        )
+        .unwrap();
+
+        let cfg = cfg_for(backup_root.path());
+        let agent = AgentConfig {
+            key: "e2".into(),
+            display_name: "e2".into(),
+            category: crate::agent::AgentCategory::CliCoding,
+            locations: vec![AgentLocation {
+                path: src.path().to_path_buf(),
+                location_type: LocationType::HomeDir,
+                kind: LocationKind::Directory,
+                backup_subdir: ".e2".into(),
+            }],
+        };
+        let reg = registry_with(&agent);
+        backup_agents(&cfg, &reg, &["e2".into()], None, false, false).unwrap();
+
+        let archive_dir = tempdir().unwrap();
+        let archive = archive_dir.path().join("e2.tar.gz");
+        let path = export_agent(&cfg, &reg, "e2", Some(archive.to_str().unwrap())).unwrap();
+        assert!(path.is_some());
+        assert!(archive.exists(), "export must produce an archive");
+        // The archive is readable and contains the agent's data.
+        let out = std::process::Command::new("tar")
+            .args(["tzf", archive.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "archive must be valid");
+        let listing = String::from_utf8_lossy(&out.stdout);
+        assert!(listing.contains(".e2/settings.json"));
     }
 }

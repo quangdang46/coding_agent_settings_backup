@@ -389,6 +389,21 @@ fn sync_walkdir(
             if !dry_run {
                 std::fs::create_dir_all(&dest_path)?;
             }
+        } else if entry.file_type().is_symlink() {
+            // Copy symlinks as symlinks, the way `rsync -a` does. Agent
+            // directories contain "latest" pointers to files that have been
+            // rotated away; without this the fallback silently dropped
+            // them, and a restore to a fresh machine would not recreate
+            // them.
+            if dry_run {
+                stats.files_copied += 1;
+                continue;
+            }
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            copy_symlink(entry.path(), &dest_path)?;
+            stats.files_copied += 1;
         } else if entry.file_type().is_file() {
             if dry_run {
                 stats.files_copied += 1;
@@ -414,6 +429,36 @@ fn sync_walkdir(
         prune_unknown(dest, dest, &kept, filter)?;
     }
     Ok(stats)
+}
+
+/// Recreate a symlink at `dest` pointing wherever `src` points.
+///
+/// The link target is copied verbatim — including a target that no longer
+/// exists, which is exactly what a dangling "latest" pointer is.
+#[cfg(unix)]
+fn copy_symlink(src: &Path, dest: &Path) -> Result<()> {
+    let target = std::fs::read_link(src)?;
+    if dest.symlink_metadata().is_ok() {
+        let _ = std::fs::remove_file(dest);
+    }
+    std::os::unix::fs::symlink(target, dest)?;
+    Ok(())
+}
+
+/// Windows counterpart of [`copy_symlink`].
+#[cfg(windows)]
+fn copy_symlink(src: &Path, dest: &Path) -> Result<()> {
+    let target = std::fs::read_link(src)?;
+    if dest.symlink_metadata().is_ok() {
+        let _ = std::fs::remove_file(dest);
+    }
+    let is_dir = std::fs::metadata(src).map(|m| m.is_dir()).unwrap_or(false);
+    if is_dir {
+        std::os::windows::fs::symlink_dir(target, dest)?;
+    } else {
+        std::os::windows::fs::symlink_file(target, dest)?;
+    }
+    Ok(())
 }
 
 /// Count files tracked by git for a specific agent subdirectory.
