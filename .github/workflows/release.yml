@@ -115,9 +115,35 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          gh release create "${TAG}" \
-            --title "${TAG}" \
-            --generate-notes \
-            --verify-tag \
-            $(find artifacts -type f | sort)
+          ASSETS=$(find artifacts -type f | sort)
+          if [ -z "${ASSETS}" ]; then
+            echo "ERROR: no build artifacts were downloaded" >&2
+            exit 1
+          fi
+          # The release may already exist — it is often created by hand
+          # before the tag is pushed. `gh release create` fails in that case,
+          # and the tag-push workflow then dies with the release published
+          # but carrying no binary assets, which breaks `curl | bash`
+          # installs for every user. Upload to the existing release instead.
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists — uploading assets to it."
+            gh release upload "${TAG}" ${ASSETS} --clobber
+          else
+            gh release create "${TAG}" \
+              --title "${TAG}" \
+              --generate-notes \
+              --verify-tag \
+              ${ASSETS}
+          fi
+      - name: Verify release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          COUNT=$(gh release view "${TAG}" --json assets -q '.assets | length')
+          echo "Release ${TAG} has ${COUNT} asset(s)"
+          if [ "${COUNT}" -eq 0 ]; then
+            echo "ERROR: release ${TAG} was published without assets" >&2
+            exit 1
+          fi
 

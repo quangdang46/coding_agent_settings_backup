@@ -82,9 +82,29 @@ if (-not (Test-Path $Dest)) {
 
 # === Resolve version ===
 function Resolve-Version {
+    param([string]$Platform)
+
     if ($Version) { return $Version }
-    
+
     Write-Info 'resolving latest release ...'
+
+    # Prefer the newest release that actually ships a binary for this
+    # platform. A release can exist without any attached assets, and
+    # installing "latest" would then 404 and fall back to a source build.
+    try {
+        $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/${OWNER}/${REPO}/releases?per_page=30" -UseBasicParsing
+        $assetName = "casb-$Platform"
+        foreach ($release in $releases) {
+            $hasAsset = $false
+            foreach ($asset in $release.assets) {
+                if ($asset.name -like "$assetName*") { $hasAsset = $true; break }
+            }
+            if ($hasAsset) { return $release.tag_name }
+        }
+    } catch {
+        Write-Warn "could not list releases: $_"
+    }
+
     try {
         $release = Invoke-RestMethod -Uri "https://api.github.com/repos/${OWNER}/${REPO}/releases/latest" -UseBasicParsing
         return $release.tag_name
@@ -180,7 +200,7 @@ $TMP = Get-TempDir
 New-Item -ItemType Directory -Path $TMP -Force | Out-Null
 
 try {
-    $ver = Resolve-Version
+    $ver = Resolve-Version -Platform 'windows-x86_64'
     Write-Info "Version: $ver"
     
     if (-not $FromSource) {

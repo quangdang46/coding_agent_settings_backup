@@ -9,9 +9,11 @@
 //! 6. Sync from the temp worktree back into the agent's source locations.
 
 use crate::agent::AgentConfig;
+use crate::agent::LocationKind;
 use crate::backup::require_repo;
 use crate::config::Config;
 use crate::error::{CasbError, Result};
+use crate::filter::ExclusionFilter;
 use crate::git::Repo;
 use crate::hooks::{run_hooks, HookKind};
 use crate::sync::{backup_dest_for, sync_backup_to_agent, SyncStats};
@@ -55,10 +57,15 @@ impl RestorePreview {
 /// Materialise the supplied ref into a temporary directory and produce a
 /// preview of changes that would be applied. The temp directory is returned
 /// alongside the preview so the caller can sync from it.
+///
+/// `filter` must be the same exclusion filter that produced the backup.
+/// Paths the backup deliberately omits are not user changes and must not
+/// appear in the preview — nor may they be deleted when the restore runs.
 pub fn build_preview(
     repo: &Repo,
     agent: &AgentConfig,
     reference: &str,
+    filter: &ExclusionFilter,
 ) -> Result<(RestorePreview, tempfile::TempDir)> {
     if !repo.ref_exists(reference) {
         return Err(CasbError::InvalidArgument(format!(
@@ -77,7 +84,13 @@ pub fn build_preview(
     for loc in &agent.locations {
         let backup_dir = backup_dest_for(tmp.path(), loc);
         let live = &loc.path;
-        compare_trees(&backup_dir, live, Path::new(""), &mut preview)?;
+        // A single-file location has no relative path of its own; use the
+        // file name so the preview reports a meaningful path.
+        let start = match loc.kind {
+            LocationKind::File => live.file_name().map(PathBuf::from).unwrap_or_default(),
+            LocationKind::Directory => PathBuf::new(),
+        };
+        compare_trees(&backup_dir, live, &start, filter, &mut preview)?;
     }
     Ok((preview, tmp))
 }
@@ -86,6 +99,7 @@ fn compare_trees(
     backup: &Path,
     live: &Path,
     rel: &Path,
+    filter: &ExclusionFilter,
     preview: &mut RestorePreview,
 ) -> Result<()> {
     let backup_exists = backup.exists();
@@ -134,7 +148,19 @@ fn compare_trees(
             continue;
         }
         let next_rel = rel.join(&name);
-        compare_trees(&backup.join(&name), &live.join(&name), &next_rel, preview)?;
+        // Skip paths the backup deliberately excludes. They are absent from
+        // the backup by design, so reporting them as differences would fill
+        // the preview with thousands of phantom changes.
+        if filter.is_excluded(&next_rel) {
+            continue;
+        }
+        compare_trees(
+            &backup.join(&name),
+            &live.join(&name),
+            &next_rel,
+            filter,
+            preview,
+        )?;
     }
     Ok(())
 }
@@ -149,7 +175,9 @@ pub fn restore_agent(
 ) -> Result<(RestorePreview, RestoreOutcome)> {
     let repo = require_repo(cfg)?;
     let refname = reference.unwrap_or("HEAD").to_string();
-    let (preview, tmp) = build_preview(&repo, agent, &refname)?;
+    let backup_root = cfg.backup_root();
+    let filter = crate::backup::build_agent_filter(cfg, agent, &backup_root)?;
+    let (preview, tmp) = build_preview(&repo, agent, &refname, &filter)?;
     let target_path: PathBuf = tmp.path().to_path_buf();
 
     let mut outcome = RestoreOutcome {
@@ -178,7 +206,9 @@ pub fn restore_agent(
 
     // Pre-restore hooks.
     run_hooks(HookKind::PreRestore, &agent.key)?;
-    let stats = sync_backup_to_agent(agent, &target_path, cfg.backup.use_rsync, false)?;
+    // The same filter that produced the backup is used here so that the
+    // restore never deletes excluded paths from the live source directory.
+    let stats = sync_backup_to_agent(agent, &target_path, &filter, cfg.backup.use_rsync, false)?;
     run_hooks(HookKind::PostRestore, &agent.key)?;
     repo.worktree_remove(&target_path)?;
 
@@ -301,5 +331,73 @@ mod tests {
         backup_agents(&cfg, &reg, &["rd".into()], None, false, false).unwrap();
         let err = restore_agent(&cfg, resolved, Some("does-not-exist"), true, false);
         assert!(err.is_err());
+    }
+
+    /// Regression: a restore must never delete files that the backup
+    /// deliberately excludes.
+    ///
+    /// `projects/`, `cache/`, `history.jsonl` and friends are excluded from
+    /// every backup, so they are absent from the backup tree. A restore that
+    /// syncs with an empty filter treats every absent file as "deleted" and
+    /// wipes them from the live source directory.
+    #[test]
+    fn restore_does_not_delete_excluded_files() {
+        let backup_root = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("projects")).unwrap();
+        std::fs::create_dir_all(src.path().join("cache")).unwrap();
+        std::fs::write(src.path().join("settings.json"), "{}").unwrap();
+        std::fs::write(src.path().join("projects/big.txt"), "IMPORTANT").unwrap();
+        std::fs::write(src.path().join("cache/c.txt"), "cache").unwrap();
+
+        let mut cfg = cfg_for(backup_root.path());
+        cfg.backup.use_rsync = true; // exercise the rsync backend
+        let agent = make_agent("re", src.path());
+        let reg = registry_with(vec![agent.clone()]);
+        let resolved = reg.get("re").unwrap();
+
+        backup_agents(&cfg, &reg, &["re".into()], None, false, false).unwrap();
+        assert!(
+            !backup_root.path().join(".re/projects/big.txt").exists(),
+            "excluded file must not be in the backup"
+        );
+
+        let (_preview, outcome) = restore_agent(&cfg, resolved, None, true, false).unwrap();
+        assert!(outcome.applied);
+        assert!(
+            src.path().join("projects/big.txt").exists(),
+            "restore must not delete excluded files from the source"
+        );
+        assert!(
+            src.path().join("cache/c.txt").exists(),
+            "restore must not delete excluded files from the source"
+        );
+        assert!(src.path().join("settings.json").exists());
+    }
+
+    /// Regression: the restore preview must not list excluded paths as
+    /// differences. Reporting thousands of intentionally-omitted files makes
+    /// the preview useless.
+    #[test]
+    fn preview_ignores_excluded_paths() {
+        let backup_root = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("projects")).unwrap();
+        std::fs::write(src.path().join("settings.json"), "{}").unwrap();
+        std::fs::write(src.path().join("projects/big.txt"), "IMPORTANT").unwrap();
+
+        let cfg = cfg_for(backup_root.path());
+        let agent = make_agent("rp", src.path());
+        let reg = registry_with(vec![agent.clone()]);
+        let resolved = reg.get("rp").unwrap();
+        backup_agents(&cfg, &reg, &["rp".into()], None, false, false).unwrap();
+
+        let (preview, _outcome) = restore_agent(&cfg, resolved, None, true, true).unwrap();
+        assert_eq!(
+            preview.total(),
+            0,
+            "excluded paths must not appear in the preview: {:?}",
+            preview
+        );
     }
 }

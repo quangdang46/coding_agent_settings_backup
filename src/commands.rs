@@ -253,11 +253,20 @@ struct ListItem {
 
 fn cmd_list(cfg: &Config, registry: &Registry, p: &mut Printer) -> Result<()> {
     let mut items = Vec::new();
+    let repo_path = cfg.backup_root();
+    let repo = crate::git::Repo::new(&repo_path);
+    let repo_exists = repo.exists();
     for agent in registry.all() {
-        let repo_path = backup::agent_repo_path(&cfg.backup_root(), agent);
-        let repo = crate::git::Repo::new(&repo_path);
-        let has_backup = repo.exists();
-        let last = if has_backup { repo.head_short()? } else { None };
+        // The backup repo is shared, so "has backup" must be answered per
+        // agent: it means this agent's own directories appear in the repo's
+        // history, not merely that the shared repository exists.
+        let subdirs = vec![agent.backup_root_subdir()];
+        let (has_backup, last) = if repo_exists {
+            let commits = repo.commit_count_for_paths(&subdirs)?;
+            (commits > 0, repo.last_commit_for_paths(&subdirs)?)
+        } else {
+            (false, None)
+        };
         items.push(ListItem {
             key: agent.key.clone(),
             display_name: agent.display_name.clone(),

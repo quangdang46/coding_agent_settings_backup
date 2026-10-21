@@ -202,14 +202,18 @@ expect_ok "backup opencode (multi-location)"      "opencode"       casb backup o
 expect_ok "opencode config/ subdir populated"     "" test -d "$HOME_DIR/.agent_settings_backups/.opencode/config"
 expect_ok "opencode data/ subdir populated"       "" test -d "$HOME_DIR/.agent_settings_backups/.opencode/data"
 
-# SQLite files: state DBs should be present (only -wal/-shm excluded).
+# SQLite files: state DBs are excluded by default — they are runtime state,
+# not configuration — while the agent's actual config is backed up.
 casb backup codex >/dev/null 2>&1
-expect_ok "codex SQLite database backed up"       "" test -f "$HOME_DIR/.agent_settings_backups/.codex/logs_2.sqlite"
+expect_ok "codex config backed up"                 "" test -f "$HOME_DIR/.agent_settings_backups/.codex/config.toml"
+expect_fail "codex SQLite state DB excluded"       test -f "$HOME_DIR/.agent_settings_backups/.codex/logs_2.sqlite"
 
 # Parallel backup of several agents at once.
 expect_ok "backup --parallel cursor gemini kiro"  ""               casb backup cursor gemini kiro --parallel
 
-# Dry run on a fresh agent must NOT create a repo.
+# Dry run on a fresh agent must NOT create a repo. It gets its own backup
+# root so the check is not satisfied by a repo left over from earlier steps.
+DRY_ROOT="$ROOT/dryrun_backups"
 mkdir -p "$ROOT/dryrun_agent"
 echo "dry" > "$ROOT/dryrun_agent/dry.txt"
 cat >> "$CFG" <<TOML
@@ -220,8 +224,8 @@ display_name = "Dry-run Mock"
 locations    = ["$ROOT/dryrun_agent"]
 exclusions   = []
 TOML
-expect_ok "--dry-run backup"                      ""               casb --dry-run backup dryagent
-expect_fail "dry-run did not create repo"        test -d "$HOME_DIR/.agent_settings_backups/.git"
+expect_ok "--dry-run backup"                      ""               env -u XDG_CONFIG_HOME -u XDG_DATA_HOME HOME="$HOME_DIR" CASB_CONFIG="$CFG" CASB_BACKUP_ROOT="$DRY_ROOT" "$CASB_BIN" --dry-run backup dryagent
+expect_fail "dry-run did not create repo"        test -d "$DRY_ROOT/.git"
 
 # --- 5. history / diff ---------------------------------------------------
 section "History / diff"
@@ -289,7 +293,8 @@ TOML
 HOME="$HOME2" CASB_CONFIG="$CFG2" "$CASB_BIN" init >/dev/null
 expect_ok "import into fresh home" "" \
     bash -c "HOME=\"$HOME2\" CASB_CONFIG=\"$CFG2\" \"$CASB_BIN\" import \"$ARCHIVE\""
-expect_ok "imported repo has .git"  "" test -d "$HOME2/.agent_settings_backups/.myagent/.git"
+expect_ok "imported repo has .git"  "" test -d "$HOME2/.agent_settings_backups/.git"
+expect_ok "imported agent data present" "" test -f "$HOME2/.agent_settings_backups/.myagent/hello.txt"
 
 # stdout/stdin pipe round-trip with `-`.
 ARCHIVE2="$ROOT/myagent_pipe.tar.gz"
@@ -317,7 +322,8 @@ else
     FAIL=$((FAIL+1)); FAILED_CHECKS+=("import from stdin (-) -> $LOG")
     printf '  [FAIL] %-50s\n' "import from stdin (-)"
 fi
-expect_ok "stdin-imported repo has .git" "" test -d "$HOME3/.agent_settings_backups/.myagent/.git"
+expect_ok "stdin-imported repo has .git" "" test -d "$HOME3/.agent_settings_backups/.git"
+expect_ok "stdin-imported agent data present" "" test -f "$HOME3/.agent_settings_backups/.myagent/hello.txt"
 
 # --- 9. verify ----------------------------------------------------------
 section "Verify"

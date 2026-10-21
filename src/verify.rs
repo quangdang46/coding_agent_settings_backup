@@ -4,7 +4,6 @@
 //! warnings vs hard errors into a single report.
 
 use crate::agent::Registry;
-use crate::backup::agent_repo_path;
 use crate::config::Config;
 use crate::error::Result;
 use crate::git::Repo;
@@ -46,10 +45,19 @@ pub fn verify_agents(cfg: &Config, registry: &Registry, keys: &[String]) -> Resu
     let mut reports = Vec::new();
     let mut all_ok = true;
 
+    // All agents share one repository, so the integrity check runs once and
+    // the result is reported for every agent. Running `git fsck` once per
+    // agent meant the same repository was walked up to nineteen times.
+    let repo = Repo::new(cfg.backup_root());
+    let repo_exists = repo.exists();
+    let shared_check = if repo_exists {
+        Some(repo.fsck()?)
+    } else {
+        None
+    };
+
     for agent in agents {
-        let repo_path = agent_repo_path(&cfg.backup_root(), agent);
-        let repo = Repo::new(&repo_path);
-        if !repo.exists() {
+        if !repo_exists {
             reports.push(AgentVerifyReport {
                 agent: agent.key.clone(),
                 repo_exists: false,
@@ -59,7 +67,7 @@ pub fn verify_agents(cfg: &Config, registry: &Registry, keys: &[String]) -> Resu
             });
             continue;
         }
-        let result = repo.fsck()?;
+        let result = shared_check.as_ref().expect("checked above");
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
         for line in result.stderr.lines() {

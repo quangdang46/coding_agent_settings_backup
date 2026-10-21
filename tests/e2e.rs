@@ -172,15 +172,20 @@ fn lifecycle_codex_single_location() {
                 .or(predicates::str::contains("codex_e2e")),
         );
 
-    // Diff against current source: excluded files (memories, sqlite, etc.) are
-    // "added" because they are in the source but not in the backup commit.
-    // After modifying config.toml we expect it to show as modified.
+    // Diff against current source. Files the backup deliberately excludes
+    // (memories, sqlite, …) are absent from the backup by design, so they
+    // must NOT be reported as differences — otherwise the diff is flooded
+    // with thousands of phantom changes.
     env.casb()
         .arg("diff")
         .arg("codex_e2e")
         .assert()
         .success()
-        .stdout(predicates::str::contains("memories").or(predicates::str::contains("sqlite")));
+        .stdout(
+            predicates::str::contains("memories")
+                .not()
+                .and(predicates::str::contains("sqlite").not()),
+        );
 
     // Modify a file in the source and re-run diff.
     fs::write(env.src_dir.join("config.toml"), "modified=true\n").unwrap();

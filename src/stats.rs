@@ -35,7 +35,7 @@ pub struct Stats {
     pub total_repo_bytes: u64,
     /// Total live source size across all agents.
     pub total_source_bytes: u64,
-    /// Total commit count.
+    /// Commit count of the shared backup repository.
     pub total_commits: u64,
 }
 
@@ -49,7 +49,6 @@ pub fn compute_stats(cfg: &Config, registry: &Registry, key: Option<&str>) -> Re
 
     let mut entries = Vec::new();
     let mut total_source = 0u64;
-    let mut total_commits = 0u64;
 
     // Shared repo stats (single .git at backup_root, same for all agents).
     let backup_root = cfg.backup_root();
@@ -78,13 +77,19 @@ pub fn compute_stats(cfg: &Config, registry: &Registry, key: Option<&str>) -> Re
                 }
             })
             .sum();
+        // Commits that actually touched this agent's directories. The shared
+        // repo's total commit count is not this agent's commit count.
+        let agent_commits = if repo_exists {
+            repo.commit_count_for_paths(&[agent.backup_root_subdir()])?
+        } else {
+            0
+        };
         total_source += source_bytes;
-        total_commits += repo_commits;
         entries.push(AgentStats {
             agent: agent.key.clone(),
             installed: agent.is_installed(),
             repo_exists,
-            commits: repo_commits,
+            commits: agent_commits,
             repo_bytes: agent_repo_bytes,
             source_bytes,
         });
@@ -94,7 +99,9 @@ pub fn compute_stats(cfg: &Config, registry: &Registry, key: Option<&str>) -> Re
         agents: entries,
         total_repo_bytes,
         total_source_bytes: total_source,
-        total_commits,
+        // The repository holds one shared history, so the total is the
+        // repository's commit count — counted once, not summed per agent.
+        total_commits: repo_commits,
     })
 }
 

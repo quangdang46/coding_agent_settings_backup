@@ -65,6 +65,13 @@ pub struct BackupConfig {
     pub use_rsync: bool,
     /// Verify file checksums during sync (rsync `--checksum`).
     pub checksum_verify: bool,
+    /// Largest single file (in MiB) that may be backed up.
+    ///
+    /// Agent directories routinely contain reinstallable binaries — macOS
+    /// `.app` bundles, downloaded CLI versions, model blobs — that would
+    /// otherwise be committed to the backup repo and bloat it by hundreds of
+    /// megabytes. Files above this limit are skipped. `0` disables the cap.
+    pub max_file_size_mb: u64,
 }
 
 impl Default for BackupConfig {
@@ -73,6 +80,7 @@ impl Default for BackupConfig {
             exclusions: default_exclusions(),
             use_rsync: true,
             checksum_verify: false,
+            max_file_size_mb: 10,
         }
     }
 }
@@ -211,6 +219,10 @@ pub fn default_exclusions() -> Vec<String> {
         "**/memories_*.sqlite*".into(),
         "**/state_*.sqlite*".into(),
         "**/data/versions/**".into(),
+        "**/versions/**".into(),
+        "versions/".into(), // rsync-compatible variant
+        "**/*.app/**".into(),
+        "*.app/".into(), // rsync-compatible variant
         "**/dist/**".into(),
         "**/target/**".into(),
         "**/*.bin".into(),
@@ -303,6 +315,7 @@ impl Config {
             "backup.use_rsync" => Some(self.backup.use_rsync.to_string()),
             "backup.checksum_verify" => Some(self.backup.checksum_verify.to_string()),
             "backup.exclusions" => Some(self.backup.exclusions.join(",")),
+            "backup.max_file_size_mb" => Some(self.backup.max_file_size_mb.to_string()),
             "schedule.method" => Some(self.schedule.method.clone()),
             "schedule.interval" => Some(self.schedule.interval.clone()),
             _ => None,
@@ -337,6 +350,13 @@ impl Config {
             "backup.checksum_verify" => {
                 self.backup.checksum_verify = parse_bool(value).ok_or_else(|| {
                     CasbError::InvalidArgument(format!("expected bool, got '{value}'"))
+                })?;
+            }
+            "backup.max_file_size_mb" => {
+                self.backup.max_file_size_mb = value.trim().parse::<u64>().map_err(|_| {
+                    CasbError::InvalidArgument(format!(
+                        "expected a non-negative integer, got '{value}'"
+                    ))
                 })?;
             }
             "schedule.method" => self.schedule.method = value.to_string(),

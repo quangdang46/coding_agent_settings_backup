@@ -34,12 +34,60 @@ impl Repo {
             return Ok(());
         }
         run_git_in(&self.path, &["init", "-q", "-b", "main"])?;
+        // Disable git's automatic garbage collection. `casb` commits once per
+        // agent, and every `git commit` would otherwise spawn a background
+        // `git gc --auto`. Those concurrent repacks each write their own pack
+        // file, so a single large blob ends up duplicated in one pack per
+        // agent and the repo grows by a multiple of its real size. `casb`
+        // runs a single controlled `git gc` at the end of a backup instead.
+        run_git_in(&self.path, &["config", "gc.auto", "0"])?;
         Ok(())
     }
 
     /// Stage all current working tree changes.
     pub fn add_all(&self) -> Result<()> {
         run_git_in(&self.path, &["add", "-A"])?;
+        Ok(())
+    }
+
+    /// Stage changes limited to the given paths.
+    ///
+    /// The backup repo is shared by every agent, so staging the whole tree
+    /// for one agent would sweep another agent's files into that agent's
+    /// commit. Scoping the staging to the agent's own subdirectories keeps
+    /// one agent's commit to that agent's files.
+    pub fn add_paths(&self, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        // An agent whose data is entirely excluded has nothing to stage, and
+        // `git add` treats a pathspec that matches no file as an error.
+        // Skip those agents instead of failing their backup.
+        let any_exists = paths
+            .iter()
+            .any(|p| !p.is_empty() && self.path.join(p).exists());
+        if !any_exists {
+            return Ok(());
+        }
+        let mut args = vec!["add", "-A", "--"];
+        args.extend(paths.iter().map(|s| s.as_str()));
+        match run_git_in(&self.path, &args) {
+            Ok(_) => Ok(()),
+            // The pathspec matched no file: nothing to stage, not an error.
+            Err(CasbError::GitCommand { stderr, .. })
+                if stderr.contains("did not match any files") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Repack the repository into a single pack file.
+    ///
+    /// Best-effort: a failure here never invalidates the backup itself.
+    pub fn compact(&self) -> Result<()> {
+        let _ = run_git_in(&self.path, &["gc", "--quiet"]);
         Ok(())
     }
 
@@ -155,14 +203,28 @@ impl Repo {
 
     /// Run `git log` and return parsed entries, newest first.
     pub fn log(&self, limit: usize) -> Result<Vec<LogEntry>> {
+        self.log_for_paths(limit, &[])
+    }
+
+    /// Run `git log` restricted to the given paths.
+    ///
+    /// All agents share one repository, so an unscoped `git log` returns every
+    /// agent's commits. Passing the agent's own subdirectories restricts the
+    /// history to the commits that actually touched that agent.
+    pub fn log_for_paths(&self, limit: usize, paths: &[String]) -> Result<Vec<LogEntry>> {
         let limit_arg = format!("-n{limit}");
+        let mut args = vec![
+            "log".to_string(),
+            "--pretty=format:%H%x1f%h%x1f%aI%x1f%an%x1f%s".to_string(),
+            limit_arg,
+        ];
+        if !paths.is_empty() {
+            args.push("--".to_string());
+            args.extend(paths.iter().cloned());
+        }
         let out = Command::new("git")
             .current_dir(&self.path)
-            .args([
-                "log",
-                "--pretty=format:%H%x1f%h%x1f%aI%x1f%an%x1f%s",
-                &limit_arg,
-            ])
+            .args(&args)
             .output()?;
         if !out.status.success() {
             return Ok(Vec::new());
@@ -194,6 +256,56 @@ impl Repo {
             }
         }
         Ok(entries)
+    }
+
+    /// Number of commits that touched the given paths.
+    pub fn commit_count_for_paths(&self, paths: &[String]) -> Result<u64> {
+        if paths.is_empty() {
+            return self.commit_count();
+        }
+        let mut args = vec![
+            "rev-list".to_string(),
+            "--count".to_string(),
+            "HEAD".to_string(),
+        ];
+        args.push("--".to_string());
+        args.extend(paths.iter().cloned());
+        let out = Command::new("git")
+            .current_dir(&self.path)
+            .args(&args)
+            .output()?;
+        if !out.status.success() {
+            return Ok(0);
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok(s.parse().unwrap_or(0))
+    }
+
+    /// The short hash of the most recent commit that touched the given paths.
+    pub fn last_commit_for_paths(&self, paths: &[String]) -> Result<Option<String>> {
+        if paths.is_empty() {
+            return self.head_short();
+        }
+        let mut args = vec![
+            "log".to_string(),
+            "-1".to_string(),
+            "--pretty=format:%h".to_string(),
+        ];
+        args.push("--".to_string());
+        args.extend(paths.iter().cloned());
+        let out = Command::new("git")
+            .current_dir(&self.path)
+            .args(&args)
+            .output()?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(s))
+        }
     }
 
     /// `(tag_name, target_commit_hash)` pairs.

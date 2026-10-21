@@ -5,7 +5,6 @@
 //! optional `detail` string.
 
 use crate::agent::Registry;
-use crate::backup::agent_repo_path;
 use crate::config::Config;
 use crate::error::Result;
 use crate::git::Repo;
@@ -66,17 +65,15 @@ pub fn run(cfg: &Config, registry: &Registry) -> Result<DoctorReport> {
         });
     }
 
-    // Each existing repo — fsck.
-    for agent in registry.all() {
-        let repo_path = agent_repo_path(&cfg.backup_root(), agent);
-        if !repo_path.join(".git").exists() {
-            continue;
-        }
+    // The backup repository — fsck. All agents share a single repository, so
+    // this walks it once instead of once per agent.
+    let repo_path = cfg.backup_root();
+    if repo_path.join(".git").exists() {
         let repo = Repo::new(&repo_path);
         match repo.fsck() {
             Ok(res) => {
                 checks.push(Check {
-                    name: format!("repo {} fsck", agent.key),
+                    name: "repo fsck".into(),
                     ok: res.ok,
                     detail: if res.ok {
                         None
@@ -86,7 +83,7 @@ pub fn run(cfg: &Config, registry: &Registry) -> Result<DoctorReport> {
                 });
             }
             Err(e) => checks.push(Check {
-                name: format!("repo {} fsck", agent.key),
+                name: "repo fsck".into(),
                 ok: false,
                 detail: Some(e.to_string()),
             }),

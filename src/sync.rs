@@ -82,14 +82,19 @@ pub fn sync_agent_to_backup(
 ///
 /// Used by `casb restore`. For each installed/known location, copies files
 /// from `dest_root/<backup_subdir>` over the source path.
+///
+/// `filter` must be the *same* filter that was used to produce the backup.
+/// The restore is destructive for anything the backup does not contain, so
+/// without the filter every excluded path — `projects/`, `history.jsonl`,
+/// `cache/`, … — would be deleted from the live source directory.
 pub fn sync_backup_to_agent(
     agent: &AgentConfig,
     src_root: &Path,
+    filter: &ExclusionFilter,
     use_rsync: bool,
     dry_run: bool,
 ) -> Result<SyncStats> {
     let mut total = SyncStats::default();
-    let empty = ExclusionFilter::new(vec![]).expect("empty filter must compile");
     for loc in &agent.locations {
         let src = backup_dest_for(src_root, loc);
         if !src.exists() {
@@ -102,7 +107,15 @@ pub fn sync_backup_to_agent(
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let stats = sync_location_raw(&src, &loc.path, &empty, use_rsync, dry_run, loc.kind)?;
+        let stats = sync_location_raw(
+            &src,
+            &loc.path,
+            filter,
+            use_rsync,
+            dry_run,
+            loc.kind,
+            SyncDirection::ToSource,
+        )?;
         total.merge(&stats);
     }
     Ok(total)
@@ -129,6 +142,12 @@ pub fn backup_dest_for(dest_root: &Path, loc: &AgentLocation) -> PathBuf {
 }
 
 /// Prune stale subdirectories from `dest_root` after all agents have synced.
+///
+/// `known_subdirs` holds the *top-level* directory names that agents occupy
+/// in the backup repo (`.claude`, `.codex`, …). Multi-location agents nest
+/// their locations one level deeper (`.claude/home`, `.claude/data`), so the
+/// caller must pass the first path component — passing the full subdirectory
+/// path would make every multi-location agent look stale and delete it.
 pub fn prune_stale_subdirs(
     known_subdirs: &std::collections::HashSet<String>,
     dest_root: &Path,
@@ -161,7 +180,30 @@ fn sync_location(
     use_rsync: bool,
     dry_run: bool,
 ) -> Result<SyncStats> {
-    sync_location_raw(&loc.path, dest, filter, use_rsync, dry_run, loc.kind)
+    sync_location_raw(
+        &loc.path,
+        dest,
+        filter,
+        use_rsync,
+        dry_run,
+        loc.kind,
+        SyncDirection::ToBackup,
+    )
+}
+
+/// Which way a sync is flowing.
+///
+/// The size cap only applies when copying *into* the backup repo: a file
+/// that is too large must never be committed to git. When restoring, the
+/// source is the backup itself, which by construction holds no oversized
+/// files — applying the cap there would make rsync skip the transfer and
+/// `--delete` would then remove the live copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncDirection {
+    /// Live agent directory → backup repo.
+    ToBackup,
+    /// Backup repo → live agent directory.
+    ToSource,
 }
 
 fn sync_location_raw(
@@ -171,17 +213,18 @@ fn sync_location_raw(
     use_rsync: bool,
     dry_run: bool,
     kind: LocationKind,
+    direction: SyncDirection,
 ) -> Result<SyncStats> {
     if !src.exists() {
         return Ok(SyncStats::default());
     }
     if matches!(kind, LocationKind::File) {
-        return sync_file(src, dest, filter, dry_run);
+        return sync_file(src, dest, filter, dry_run, direction);
     }
     if use_rsync && util::which("rsync") {
-        return sync_rsync(src, dest, filter, dry_run);
+        return sync_rsync(src, dest, filter, dry_run, direction);
     }
-    sync_walkdir(src, dest, filter, dry_run)
+    sync_walkdir(src, dest, filter, dry_run, direction)
 }
 
 fn sync_file(
@@ -189,9 +232,16 @@ fn sync_file(
     dest: &Path,
     filter: &ExclusionFilter,
     dry_run: bool,
+    direction: SyncDirection,
 ) -> Result<SyncStats> {
     let basename = src.file_name().unwrap_or_default();
     if filter.is_excluded(Path::new(basename)) {
+        return Ok(SyncStats {
+            files_skipped: 1,
+            ..Default::default()
+        });
+    }
+    if direction == SyncDirection::ToBackup && filter.exceeds_size_cap(src) {
         return Ok(SyncStats {
             files_skipped: 1,
             ..Default::default()
@@ -219,6 +269,7 @@ fn sync_rsync(
     dest: &Path,
     filter: &ExclusionFilter,
     dry_run: bool,
+    direction: SyncDirection,
 ) -> Result<SyncStats> {
     use std::process::Command;
 
@@ -237,6 +288,16 @@ fn sync_rsync(
     // would delete them. The backup repo already manages its own .gitignore.
     args.push("--exclude".to_string());
     args.push(".gitignore".to_string());
+    // Never transfer oversized files into the backup: agent directories
+    // contain reinstallable binaries (macOS `.app` bundles, downloaded CLI
+    // versions) that would otherwise be committed to git and bloat the repo
+    // by hundreds of megabytes. rsync skips them, and because the same
+    // patterns are in the repo's `.gitignore`, git never tracks them either.
+    if direction == SyncDirection::ToBackup {
+        if let Some(cap) = filter.max_file_size() {
+            args.push(format!("--max-size={cap}"));
+        }
+    }
     for pat in filter.raw_patterns() {
         args.push("--exclude".to_string());
         args.push(pat.clone());
@@ -281,6 +342,7 @@ fn sync_walkdir(
     dest: &Path,
     filter: &ExclusionFilter,
     dry_run: bool,
+    direction: SyncDirection,
 ) -> Result<SyncStats> {
     let mut stats = SyncStats::default();
     if !dry_run {
@@ -317,6 +379,10 @@ fn sync_walkdir(
             stats.files_skipped += 1;
             continue;
         }
+        if direction == SyncDirection::ToBackup && filter.exceeds_size_cap(entry.path()) {
+            stats.files_skipped += 1;
+            continue;
+        }
         let dest_path = dest.join(&rel);
         kept.insert(rel.clone());
         if entry.file_type().is_dir() {
@@ -345,7 +411,7 @@ fn sync_walkdir(
                 kept.len()
             );
         }
-        prune_unknown(dest, dest, &kept)?;
+        prune_unknown(dest, dest, &kept, filter)?;
     }
     Ok(stats)
 }
@@ -384,7 +450,17 @@ pub fn count_git_tracked(repo_path: &Path, agent_subdir: &str) -> Result<SyncSta
 
 /// Remove files/dirs under `root` that don't appear in `kept` (relative
 /// paths). `.git` is always preserved.
-fn prune_unknown(root: &Path, cur: &Path, kept: &std::collections::HashSet<PathBuf>) -> Result<()> {
+///
+/// Paths matched by `filter` are never removed. They are deliberately absent
+/// from the backup, so treating them as "unknown" would delete live data that
+/// the backup was never supposed to contain — the exact mirror image of the
+/// `restore` data-loss bug.
+fn prune_unknown(
+    root: &Path,
+    cur: &Path,
+    kept: &std::collections::HashSet<PathBuf>,
+    filter: &ExclusionFilter,
+) -> Result<()> {
     if !cur.is_dir() {
         return Ok(());
     }
@@ -398,9 +474,12 @@ fn prune_unknown(root: &Path, cur: &Path, kept: &std::collections::HashSet<PathB
         if rel.as_os_str() == ".git" {
             continue;
         }
+        if filter.is_excluded(&rel) {
+            continue;
+        }
         let ftype = entry.file_type()?;
         if ftype.is_dir() {
-            prune_unknown(root, &path, kept)?;
+            prune_unknown(root, &path, kept, filter)?;
             // After pruning, remove if empty and not in kept.
             if !kept.contains(&rel) && std::fs::read_dir(&path)?.next().is_none() {
                 std::fs::remove_dir(&path)?;
@@ -435,7 +514,14 @@ mod tests {
         std::fs::write(src.path().join("a/file.txt"), "hi").unwrap();
         std::fs::write(src.path().join("ignored.log"), "x").unwrap();
         let filter = ExclusionFilter::new(vec!["*.log".into()]).unwrap();
-        let stats = sync_walkdir(src.path(), dest.path(), &filter, false).unwrap();
+        let stats = sync_walkdir(
+            src.path(),
+            dest.path(),
+            &filter,
+            false,
+            SyncDirection::ToBackup,
+        )
+        .unwrap();
         assert!(stats.files_copied >= 1);
         assert!(dest.path().join("a/file.txt").exists());
         assert!(!dest.path().join("ignored.log").exists());
@@ -448,7 +534,14 @@ mod tests {
         std::fs::write(src.path().join("a.txt"), "1").unwrap();
         std::fs::write(dest.path().join("stale.txt"), "2").unwrap();
         let filter = ExclusionFilter::new(vec![]).unwrap();
-        sync_walkdir(src.path(), dest.path(), &filter, false).unwrap();
+        sync_walkdir(
+            src.path(),
+            dest.path(),
+            &filter,
+            false,
+            SyncDirection::ToBackup,
+        )
+        .unwrap();
         assert!(!dest.path().join("stale.txt").exists());
         assert!(dest.path().join("a.txt").exists());
     }
@@ -459,7 +552,14 @@ mod tests {
         let dest = tempdir().unwrap();
         std::fs::write(src.path().join("a.txt"), "1").unwrap();
         let filter = ExclusionFilter::new(vec![]).unwrap();
-        sync_walkdir(src.path(), dest.path(), &filter, true).unwrap();
+        sync_walkdir(
+            src.path(),
+            dest.path(),
+            &filter,
+            true,
+            SyncDirection::ToBackup,
+        )
+        .unwrap();
         assert!(!dest.path().join("a.txt").exists());
     }
 
@@ -529,7 +629,14 @@ mod tests {
         std::fs::write(dest.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
 
         let filter = ExclusionFilter::new(vec![]).unwrap();
-        sync_walkdir(src.path(), dest.path(), &filter, false).unwrap();
+        sync_walkdir(
+            src.path(),
+            dest.path(),
+            &filter,
+            false,
+            SyncDirection::ToBackup,
+        )
+        .unwrap();
 
         // The destination's own .git must be intact.
         assert!(dest.path().join(".git/HEAD").exists());

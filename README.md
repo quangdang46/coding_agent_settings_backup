@@ -190,11 +190,29 @@ output_format = "text"
 exclusions = ["*.log", "*.tmp", "**/cache/**", "*.sqlite3-wal*"]
 use_rsync = true
 checksum_verify = false
+max_file_size_mb = 10   # skip files larger than this; 0 = no limit
 
 [schedule]
 method = "systemd"    # systemd | cron | none
 interval = "daily"    # hourly | daily | weekly
 ```
+
+### What gets excluded
+
+Agent directories are mostly *runtime state*, not configuration. casb backs up
+the settings you would otherwise have to retype, and skips the rest:
+
+| Excluded | Why |
+|----------|-----|
+| `projects/`, `sessions/`, `history.jsonl`, `transcripts/` | Conversation history — regenerable, and often gigabytes |
+| `packages/`, `plugins/`, `computer-use/`, `skills/`, `marketplaces/` | Reinstallable bundles |
+| `node_modules/`, `__pycache__/`, `venv/` | Dependency trees |
+| `*.sqlite`, `*.db`, `*.sqlite3-wal`, `*.sqlite3-shm` | Runtime state databases, not config |
+| `*.app/`, `versions/` | Downloaded application bundles and CLI binaries |
+| Files over `max_file_size_mb` | Safety net — one 250 MB binary would bloat the repo more than everything else combined |
+
+The same filter governs backup, `diff`, and `restore`, so `restore` never
+deletes a path that was deliberately left out of the backup.
 
 | Env var | Maps to |
 |---------|---------|
@@ -223,7 +241,7 @@ interval = "daily"    # hourly | daily | weekly
 | **Agent coverage** | 19 built-in agents — not every CLI tool on earth. `discover` helps find custom ones |
 | **No cloud sync** | casb is local-first. Export/import for migration; no built-in push to S3/Backblaze |
 | **git required** | Relies on `git` in PATH. If git is absent, backup falls back to file copy (no versioning) |
-| **SQLite WAL exclusion** | `*.sqlite3-wal` / `*.sqlite3-shm` are excluded — they are temp files, not the DB itself |
+| **SQLite databases excluded** | `*.sqlite` / `*.db` are runtime state, not configuration — exclude them via `exclusions` if you want them |
 
 ---
 

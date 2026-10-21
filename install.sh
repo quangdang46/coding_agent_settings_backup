@@ -97,8 +97,42 @@ detect_platform() {
 }
 
 # === Version ===
+# List the newest release that actually ships a binary for this platform.
+#
+# A release can exist without any attached assets — that happened when the
+# release was published by hand before the tag was pushed, so the tag's
+# workflow failed to attach the binaries. Installing "latest" then downloads
+# a 404 and silently falls back to a source build. Preferring the newest
+# release that has the platform's asset keeps `curl | bash` working.
+pick_version_with_assets() {
+    local platform="$1" json
+    json=$(curl -fsSL --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/${OWNER}/${REPO}/releases?per_page=30" 2>/dev/null) || return 1
+    printf '%s' "$json" | awk -v plat="casb-${platform}" '
+        /"tag_name":/ {
+            if (match($0, /"tag_name":[[:space:]]*"[^"]+"/)) {
+                tag = substr($0, RSTART, RLENGTH)
+                gsub(/.*"tag_name":[[:space:]]*"|"$/, "", tag)
+                have = 0
+            }
+        }
+        /browser_download_url/ { if (index($0, plat) > 0) have = 1 }
+        /^  \}/ { if (tag != "" && have == 1) { print tag; exit } }
+    ' 2>/dev/null || true
+}
+
 resolve_version() {
+    local platform="${1:-}"
     [ -n "$VERSION" ] && return 0
+
+    if [ -n "$platform" ]; then
+        VERSION=$(pick_version_with_assets "$platform")
+        if [[ "$VERSION" =~ ^v[0-9] ]]; then
+            log_info "Latest: $VERSION"
+            return 0
+        fi
+    fi
+
     VERSION=$(curl -fsSL --connect-timeout 10 --max-time 30 \
         "https://api.github.com/repos/${OWNER}/${REPO}/releases/latest" 2>/dev/null \
         | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/') || true
@@ -163,7 +197,7 @@ main() {
     log_info "Platform: $platform | Dest: $DEST"
 
     if [ "$FROM_SOURCE" -eq 0 ]; then
-        resolve_version
+        resolve_version "$platform"
         local ext="tar.gz"; [[ "$platform" == windows* ]] && ext="zip"
         local archive="${BINARY_NAME}-${platform}.${ext}"
         local url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive}"

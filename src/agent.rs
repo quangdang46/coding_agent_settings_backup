@@ -83,6 +83,29 @@ impl AgentConfig {
     pub fn installed_locations(&self) -> impl Iterator<Item = &AgentLocation> {
         self.locations.iter().filter(|l| l.path.exists())
     }
+
+    /// The top-level subdirectory of the backup repo that holds this agent's
+    /// data (`.claude` for Claude Code, `.codex` for Codex, …).
+    ///
+    /// Multi-location agents store each location under a nested path
+    /// (`.claude/home`, `.claude/data`, `.claude/root`), so the agent's data
+    /// is identified by the *first* path component. Commands that operate on
+    /// "one agent's data" — git history, stats, list status — must use this
+    /// rather than a single location's subdirectory, or they would only see
+    /// part of the agent.
+    pub fn backup_root_subdir(&self) -> String {
+        self.locations
+            .first()
+            .map(|l| {
+                l.backup_subdir
+                    .split('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&l.backup_subdir)
+                    .to_string()
+            })
+            .unwrap_or_else(|| format!(".{}", self.key))
+    }
 }
 
 /// Convenience constructor for [`AgentLocation`] in built-ins.
@@ -327,6 +350,18 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Build a registry from an explicit list of agent definitions.
+    ///
+    /// Unlike [`Registry::from_config`], this keeps each agent's
+    /// `backup_subdir` exactly as given, which is what multi-location agents
+    /// need: their locations live under nested paths (`.claude/home`,
+    /// `.claude/data`) rather than a single flat directory.
+    pub fn from_agents(agents: Vec<AgentConfig>) -> Self {
+        let mut agents = agents;
+        agents.sort_by(|a, b| a.key.cmp(&b.key));
+        Self { agents }
+    }
+
     /// Build a registry by merging built-in agents with overrides from `cfg`.
     ///
     /// User entries with `enabled = false` remove the matching built-in.

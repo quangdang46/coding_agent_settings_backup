@@ -18,10 +18,14 @@ pub fn diff_since_last_backup(cfg: &Config, agent: &AgentConfig) -> Result<Resto
             key: agent.key.clone(),
         });
     }
+    // Use the same exclusion filter as the backup: files the backup
+    // deliberately omits are not user changes and must not show up here.
+    let backup_root = cfg.backup_root();
+    let filter = crate::backup::build_agent_filter(cfg, agent, &backup_root)?;
     // Inverse of build_preview's perspective: we want changes the user has
     // made vs the backup. The same comparator works because it categorises
     // by presence on each side.
-    let (preview, tmp) = build_preview(&repo, agent, "HEAD")?;
+    let (preview, tmp) = build_preview(&repo, agent, "HEAD", &filter)?;
     repo.worktree_remove(tmp.path())?;
     // Swap added/removed: from the user's perspective, files in HEAD but
     // not in source are *removed* by the user; files in source but not HEAD

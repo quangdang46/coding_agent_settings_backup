@@ -41,6 +41,16 @@ pub fn agent_repo_path(backup_root: &Path, _agent: &AgentConfig) -> PathBuf {
 }
 
 /// Backup all installed agents (or `keys` if non-empty).
+///
+/// The work is split into three phases:
+///
+/// 1. **Sync** — copy each agent's files into the backup repo. This is the
+///    slow part and the only part that can safely run concurrently.
+/// 2. **Commit** — stage and commit each agent's files. The backup repo is
+///    shared by every agent, so it has exactly one git index: running this
+///    phase concurrently makes git fail with `index.lock` contention.
+/// 3. **Clean up** — remove gitignored leftovers and repack the repository,
+///    once, after every agent has committed.
 pub fn backup_agents(
     cfg: &Config,
     registry: &Registry,
@@ -72,68 +82,205 @@ pub fn backup_agents(
         let repo = Repo::new(&backup_root);
         if !repo.exists() {
             repo.init()?;
-            write_default_gitignore(&backup_root, &cfg.backup.exclusions)?;
         }
+        // Refresh the repo's .gitignore every run so that newly added
+        // exclusion patterns take effect on an existing backup repo.
+        write_default_gitignore(&backup_root, &cfg.backup.exclusions)?;
     }
 
-    let do_one = |agent: &AgentConfig| -> BackupOutcome {
-        let res = backup_one(cfg, agent, &backup_root, message, dry_run);
-        match res {
-            Ok(mut outcome) => {
-                if !outcome.installed {
-                    outcome.error = Some("not installed".to_string());
+    // ── Phase 1: copy files (parallelisable) ─────────────────────────
+    let sync_phase = |agent: &AgentConfig| -> SyncPhase {
+        if !agent.is_installed() {
+            return SyncPhase {
+                installed: false,
+                stats: SyncStats::default(),
+                error: None,
+            };
+        }
+        let filter = match build_agent_filter(cfg, agent, &backup_root) {
+            Ok(f) => f,
+            Err(e) => {
+                return SyncPhase {
+                    installed: true,
+                    stats: SyncStats::default(),
+                    error: Some(e.to_string()),
                 }
-                outcome
             }
-            Err(e) => BackupOutcome {
-                agent: agent.key.clone(),
-                installed: agent.is_installed(),
-                committed: false,
-                commit: None,
-                sync: SyncStats::default(),
+        };
+        if !dry_run {
+            if let Err(e) = run_hooks(HookKind::PreBackup, &agent.key) {
+                return SyncPhase {
+                    installed: true,
+                    stats: SyncStats::default(),
+                    error: Some(e.to_string()),
+                };
+            }
+        }
+        match sync_agent_to_backup(agent, &backup_root, &filter, cfg.backup.use_rsync, dry_run) {
+            Ok(stats) => SyncPhase {
+                installed: true,
+                stats,
+                error: None,
+            },
+            Err(e) => SyncPhase {
+                installed: true,
+                stats: SyncStats::default(),
                 error: Some(e.to_string()),
             },
         }
     };
 
-    let outcomes: Vec<BackupOutcome> = if parallel && !dry_run {
-        agents.par_iter().map(|a| do_one(a)).collect()
+    let phases: Vec<SyncPhase> = if parallel && !dry_run {
+        agents.par_iter().map(|a| sync_phase(a)).collect()
     } else {
-        agents.iter().map(|a| do_one(a)).collect()
+        agents.iter().map(|a| sync_phase(a)).collect()
     };
 
-    // Prune stale agent subdirs after all agents have synced.
+    // ── Phase 2: stage and commit (serial — one index for the repo) ──
+    let repo = Repo::new(&backup_root);
+    let mut outcomes: Vec<BackupOutcome> = Vec::with_capacity(agents.len());
+
+    for (agent, phase) in agents.iter().zip(phases.iter()) {
+        let mut committed = false;
+        let mut commit = None;
+        let mut error = phase.error.clone();
+
+        if error.is_none() && !dry_run {
+            // Scope the staging to this agent's own directories so a shared
+            // repo cannot sweep one agent's files into another's commit.
+            let subdirs = agent_backup_subdirs(agent);
+            let stage_result = repo.add_paths(&subdirs).and_then(|_| {
+                let msg = message.map(|s| s.to_string()).unwrap_or_else(|| {
+                    format!(
+                        "casb backup {} at {}",
+                        agent.key,
+                        Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                    )
+                });
+                if cfg.general.auto_commit {
+                    repo.commit(&msg)
+                } else {
+                    Ok(false)
+                }
+            });
+            match stage_result {
+                Ok(was_committed) => {
+                    committed = was_committed;
+                    // Report the agent's *own* most recent commit, never the
+                    // shared HEAD (which may belong to a different agent).
+                    commit = repo.last_commit_for_paths(&subdirs)?;
+                }
+                Err(e) => error = Some(e.to_string()),
+            }
+        }
+
+        // Count files actually tracked by git (after exclusions), not the
+        // temporary rsync count which includes files that gitignore drops.
+        let stats = if !dry_run && error.is_none() {
+            crate::sync::count_git_tracked(&backup_root, &agent.backup_root_subdir())?
+        } else {
+            phase.stats.clone()
+        };
+
+        if !dry_run && error.is_none() {
+            run_hooks(HookKind::PostBackup, &agent.key)?;
+        }
+
+        if !phase.installed && error.is_none() {
+            error = Some("not installed".to_string());
+        }
+
+        outcomes.push(BackupOutcome {
+            agent: agent.key.clone(),
+            installed: phase.installed,
+            committed,
+            commit,
+            sync: stats,
+            error,
+        });
+    }
+
+    // ── Phase 3: clean up once, after every agent has committed ──────
     if !dry_run {
-        let known_subdirs: HashSet<String> = agents
-            .iter()
+        // Remove files excluded by .gitignore from disk (packages/,
+        // plugins/, computer-use/) that rsync may have copied but git
+        // refused to track — keeps backup root lean (~MB not GB).
+        if std::env::var("CASB_DEBUG_CLEAN").is_ok() {
+            let out = std::process::Command::new("git")
+                .current_dir(&backup_root)
+                .args(["clean", "-fdX", "-n"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            eprintln!("[clean DEBUG] would remove:\n{}", out);
+        }
+        repo.clean_ignored()?;
+
+        // Prune stale agent subdirs after all agents have synced. The set of
+        // live directories is derived from *every installed agent*, not just
+        // the ones in this run: backing up a single agent must not delete
+        // another installed agent's directory from the working tree. Compare
+        // top-level names: a multi-location agent such as Claude stores its
+        // data under `.claude/home`, `.claude/data` and `.claude/root`, and
+        // matching the full subdirectory path would make `.claude` look
+        // stale and delete the agent's whole backup.
+        let known_subdirs: HashSet<String> = registry
+            .installed()
             .flat_map(|a| a.installed_locations())
-            .map(|l| l.backup_subdir.clone())
+            .map(|l| top_level_subdir(&l.backup_subdir))
             .collect();
         crate::sync::prune_stale_subdirs(&known_subdirs, &backup_root)?;
+
+        repo.compact()?;
     }
 
     Ok(outcomes)
 }
 
-fn backup_one(
+/// Result of the file-copy phase for one agent.
+#[derive(Debug, Clone)]
+struct SyncPhase {
+    installed: bool,
+    stats: SyncStats,
+    error: Option<String>,
+}
+
+/// The first path component of a backup subdirectory (`.claude` for
+/// `.claude/home`).
+fn top_level_subdir(subdir: &str) -> String {
+    subdir
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(subdir)
+        .to_string()
+}
+
+/// The top-level backup directories an agent occupies.
+fn agent_backup_subdirs(agent: &AgentConfig) -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    for loc in &agent.locations {
+        let top = top_level_subdir(&loc.backup_subdir);
+        if !dirs.contains(&top) {
+            dirs.push(top);
+        }
+    }
+    if dirs.is_empty() {
+        dirs.push(agent.backup_root_subdir());
+    }
+    dirs
+}
+
+/// Build the exclusion filter for one agent.
+///
+/// The same filter must be used for backup, diff and restore. If restore
+/// used a different (or empty) filter it would delete every excluded path
+/// from the live source directory.
+pub fn build_agent_filter(
     cfg: &Config,
     agent: &AgentConfig,
     backup_root: &Path,
-    message: Option<&str>,
-    dry_run: bool,
-) -> Result<BackupOutcome> {
-    if !agent.is_installed() {
-        return Ok(BackupOutcome {
-            agent: agent.key.clone(),
-            installed: false,
-            committed: false,
-            commit: None,
-            sync: SyncStats::default(),
-            error: None,
-        });
-    }
-    let repo = Repo::new(backup_root);
-
+) -> Result<ExclusionFilter> {
     let agent_extras = cfg
         .agents
         .get(&agent.key)
@@ -143,7 +290,8 @@ fn backup_one(
         &crate::config::default_exclusions(),
         &cfg.backup.exclusions,
         &agent_extras,
-    )?;
+    )?
+    .with_max_file_size(max_file_size_bytes(cfg));
     for loc in agent.installed_locations() {
         if matches!(loc.kind, crate::agent::LocationKind::Directory) {
             let candidate = loc.path.join(".casbignore");
@@ -151,64 +299,15 @@ fn backup_one(
         }
     }
     filter.merge_casbignore_file(&backup_root.join(".casbignore"))?;
+    Ok(filter)
+}
 
-    if !dry_run {
-        run_hooks(HookKind::PreBackup, &agent.key)?;
+/// The configured per-file size cap in bytes. `0` disables the cap.
+pub fn max_file_size_bytes(cfg: &Config) -> Option<u64> {
+    match cfg.backup.max_file_size_mb {
+        0 => None,
+        mb => Some(mb.saturating_mul(1024 * 1024)),
     }
-
-    let _stats = sync_agent_to_backup(agent, backup_root, &filter, cfg.backup.use_rsync, dry_run)?;
-
-    let mut committed = false;
-    let mut commit = None;
-    if !dry_run && cfg.general.auto_commit {
-        repo.add_all()?;
-        let msg = message.map(|s| s.to_string()).unwrap_or_else(|| {
-            format!(
-                "casb backup {} at {}",
-                agent.key,
-                Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-            )
-        });
-        committed = repo.commit(&msg)?;
-        commit = repo.head_short()?;
-        // Remove files excluded by .gitignore from disk (packages/,
-        // plugins/, computer-use/) that rsync may have copied but git
-        // refused to track — keeps backup root lean (~MB not GB).
-        if std::env::var("CASB_DEBUG_CLEAN").is_ok() {
-            let out = std::process::Command::new("git")
-                .current_dir(backup_root)
-                .args(["clean", "-fdX", "-n"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_default();
-            eprintln!("[clean DEBUG] would remove:\n{}", out);
-        }
-        repo.clean_ignored()?;
-    } else if !dry_run {
-        repo.add_all()?;
-        commit = repo.head_short()?;
-    }
-
-    // Count files actually tracked by git (after exclusions), not the
-    // temporary rsync count which includes files that gitignore drops.
-    let stats = if !dry_run && commit.is_some() {
-        crate::sync::count_git_tracked(backup_root, &agent.locations[0].backup_subdir)?
-    } else {
-        _stats
-    };
-
-    if !dry_run {
-        run_hooks(HookKind::PostBackup, &agent.key)?;
-    }
-
-    Ok(BackupOutcome {
-        agent: agent.key.clone(),
-        installed: true,
-        committed,
-        commit,
-        sync: stats,
-        error: None,
-    })
 }
 
 /// Initialise the backup root directory.
@@ -328,8 +427,26 @@ mod tests {
         assert_eq!(p, std::path::PathBuf::from("/tmp"));
     }
 
+    fn registry_with(agent: &AgentConfig) -> Registry {
+        let mut cfg = Config::default();
+        cfg.agents.insert(
+            agent.key.clone(),
+            crate::config::CustomAgentConfig {
+                enabled: true,
+                display_name: Some(agent.display_name.clone()),
+                locations: agent
+                    .locations
+                    .iter()
+                    .map(|l| l.path.display().to_string())
+                    .collect(),
+                exclusions: vec![],
+            },
+        );
+        Registry::from_config(&cfg).unwrap()
+    }
+
     #[test]
-    fn backup_one_creates_repo_and_commits() {
+    fn backup_creates_repo_and_commits() {
         let backup_root = tempdir().unwrap();
         let src = tempdir().unwrap();
         std::fs::write(src.path().join("a.txt"), "hello").unwrap();
@@ -347,12 +464,13 @@ mod tests {
         );
         assert!(outcomes.is_err());
 
-        // Initialize the single .git repo (done by backup_agents in real usage).
-        let repo = Repo::new(backup_root.path());
-        repo.init().unwrap();
-        let outcome = backup_one(&cfg, &agent, backup_root.path(), Some("msg"), false).unwrap();
-        assert!(outcome.installed);
-        assert!(outcome.committed);
+        let reg = registry_with(&agent);
+        let outcomes =
+            backup_agents(&cfg, &reg, &["test1".into()], Some("msg"), false, false).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].installed);
+        assert!(outcomes[0].committed);
+        assert!(outcomes[0].error.is_none());
         // .git is at backup_root; file lands in .test1/ subdir.
         assert!(backup_root.path().join(".git").exists());
         assert!(backup_root.path().join(".test1").join("a.txt").exists());
@@ -365,14 +483,139 @@ mod tests {
         std::fs::write(src.path().join("a.txt"), "x").unwrap();
         let cfg = cfg_for(backup_root.path());
         let agent = make_agent("dry", src.path());
-        let repo = Repo::new(backup_root.path());
-        repo.init().unwrap();
+        let reg = registry_with(&agent);
 
-        let outcome = backup_one(&cfg, &agent, backup_root.path(), None, true).unwrap();
-        assert!(outcome.installed);
-        assert!(!outcome.committed);
-        // Dry run does not stage new changes.
-        assert!(!outcome.committed);
+        let outcomes = backup_agents(&cfg, &reg, &["dry".into()], None, false, true).unwrap();
+        assert!(outcomes[0].installed);
+        assert!(!outcomes[0].committed);
+        // Dry run must not create the repo or copy any file.
+        assert!(!backup_root.path().join(".git").exists());
+        assert!(!backup_root.path().join(".dry").join("a.txt").exists());
+    }
+
+    /// Regression: a multi-location agent stores its data under a nested
+    /// path (`.claude/home`, `.claude/data`). The stale-subdirectory prune
+    /// compares top-level names, so it must not delete `.claude`.
+    #[test]
+    fn multi_location_agent_dir_survives_prune() {
+        let backup_root = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), "hello").unwrap();
+        let cfg = cfg_for(backup_root.path());
+
+        let agent = AgentConfig {
+            key: "claude".into(),
+            display_name: "Claude".into(),
+            category: AgentCategory::CliCoding,
+            locations: vec![
+                AgentLocation {
+                    path: src.path().to_path_buf(),
+                    location_type: LocationType::HomeDir,
+                    kind: LocationKind::Directory,
+                    backup_subdir: ".claude/home".into(),
+                },
+                AgentLocation {
+                    path: src.path().join("data").to_path_buf(),
+                    location_type: LocationType::HomeDir,
+                    kind: LocationKind::Directory,
+                    backup_subdir: ".claude/data".into(),
+                },
+            ],
+        };
+        let reg = Registry::from_agents(vec![agent]);
+        backup_agents(&cfg, &reg, &["claude".into()], None, false, false).unwrap();
+
+        assert!(
+            backup_root
+                .path()
+                .join(".claude")
+                .join("home")
+                .join("a.txt")
+                .exists(),
+            "multi-location agent data must survive the prune"
+        );
+    }
+
+    /// Regression: `casb backup --parallel` must not fail with git
+    /// `index.lock` contention. The file copy runs concurrently, the git
+    /// index is used one agent at a time.
+    #[test]
+    fn parallel_backup_commits_every_agent() {
+        let backup_root = tempdir().unwrap();
+        let mut cfg = cfg_for(backup_root.path());
+        cfg.backup.use_rsync = true;
+        // The source directories must outlive the backup run.
+        let sources: Vec<_> = ["p1", "p2", "p3", "p4", "p5", "p6"]
+            .iter()
+            .map(|name| {
+                let src = tempdir().unwrap();
+                std::fs::write(src.path().join("f.txt"), name).unwrap();
+                src
+            })
+            .collect();
+        let agents: Vec<AgentConfig> = sources
+            .iter()
+            .enumerate()
+            .map(|(i, src)| {
+                let key = format!("p{}", i + 1);
+                AgentConfig {
+                    key: key.clone(),
+                    display_name: key.clone(),
+                    category: AgentCategory::CliCoding,
+                    locations: vec![AgentLocation {
+                        path: src.path().to_path_buf(),
+                        location_type: LocationType::HomeDir,
+                        kind: LocationKind::Directory,
+                        backup_subdir: format!(".{key}"),
+                    }],
+                }
+            })
+            .collect();
+        let keys: Vec<String> = agents.iter().map(|a| a.key.clone()).collect();
+        let reg = Registry::from_agents(agents);
+        let outcomes = backup_agents(&cfg, &reg, &keys, None, true, false).unwrap();
+        assert_eq!(outcomes.len(), keys.len());
+        for o in &outcomes {
+            assert!(o.error.is_none(), "{} failed: {:?}", o.agent, o.error);
+            assert!(o.committed, "{} was not committed", o.agent);
+        }
+        let repo = Repo::new(backup_root.path());
+        assert_eq!(repo.commit_count().unwrap(), keys.len() as u64);
+    }
+
+    /// Regression: oversized files must never reach the backup repo. Agent
+    /// directories contain reinstallable binaries (macOS `.app` bundles,
+    /// downloaded CLI versions) that would otherwise be committed and bloat
+    /// the repository by hundreds of megabytes.
+    #[test]
+    fn oversized_files_are_not_backed_up() {
+        let backup_root = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::write(src.path().join("small.txt"), "ok").unwrap();
+        let big = src.path().join("big.bin");
+        std::fs::write(&big, vec![0u8; 2 * 1024 * 1024]).unwrap();
+
+        let mut cfg = cfg_for(backup_root.path());
+        cfg.backup.max_file_size_mb = 1; // 1 MiB cap
+        let agent = make_agent("sized", src.path());
+        let reg = registry_with(&agent);
+        backup_agents(&cfg, &reg, &["sized".into()], None, false, false).unwrap();
+
+        assert!(backup_root.path().join(".sized").join("small.txt").exists());
+        assert!(
+            !backup_root.path().join(".sized").join("big.bin").exists(),
+            "oversized file must not be copied into the backup"
+        );
+        let tracked = std::process::Command::new("git")
+            .current_dir(backup_root.path())
+            .args(["ls-files", ".sized"])
+            .output()
+            .unwrap();
+        let listed = String::from_utf8_lossy(&tracked.stdout);
+        assert!(
+            !listed.contains("big.bin"),
+            "oversized file must not be tracked"
+        );
     }
 
     #[test]

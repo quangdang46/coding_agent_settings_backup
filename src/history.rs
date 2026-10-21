@@ -23,7 +23,11 @@ pub struct History {
 /// Compute history for one agent.
 pub fn agent_history(cfg: &Config, agent: &AgentConfig, limit: usize) -> Result<History> {
     let repo = require_repo(cfg)?;
-    let entries = repo.log(limit)?;
+    // All agents share one repository, so the log must be restricted to the
+    // agent's own directories. An unscoped `git log` would list every other
+    // agent's commits as this agent's history.
+    let subdirs = vec![agent.backup_root_subdir()];
+    let entries = repo.log_for_paths(limit, &subdirs)?;
     Ok(History {
         agent: agent.key.clone(),
         count: entries.len(),
