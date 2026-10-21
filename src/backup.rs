@@ -394,16 +394,25 @@ pub fn format_outcome_text(outcome: &BackupOutcome) -> String {
         return format!("• {} — not installed", outcome.agent);
     }
     let bytes = format_bytes(outcome.sync.bytes_copied);
-    let commit = outcome.commit.as_deref().unwrap_or("(no commits)");
-    let label = if outcome.committed {
-        "committed"
-    } else {
-        "no changes"
-    };
-    format!(
-        "✓ {} — {} files, {bytes} ({commit}, {label})",
-        outcome.agent, outcome.sync.files_copied,
-    )
+    match outcome.commit.as_deref() {
+        Some(commit) => {
+            let label = if outcome.committed {
+                "committed"
+            } else {
+                "no changes"
+            };
+            format!(
+                "✓ {} — {} files, {bytes} ({commit}, {label})",
+                outcome.agent, outcome.sync.files_copied,
+            )
+        }
+        // The agent has nothing in the repository yet — no commit to point
+        // at, and no other agent's commit to borrow.
+        None => format!(
+            "✓ {} — {} files, {bytes} (nothing backed up yet)",
+            outcome.agent, outcome.sync.files_copied,
+        ),
+    }
 }
 
 #[cfg(test)]
