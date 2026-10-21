@@ -159,7 +159,8 @@ casb hooks
 ### 15. config
 ```bash
 casb config
-casb config get backup_root
+casb config get general.backup_root
+casb config get backup.max_file_size_mb
 ```
 
 ### 16. completion
@@ -167,6 +168,38 @@ casb config get backup_root
 casb completion bash > /tmp/casb-completion.bash
 casb completion zsh > /tmp/casb-completion.zsh
 casb completion fish > /tmp/casb-completion.fish
+```
+
+---
+
+## What To Look For
+
+The commands above are only half the test. These are the behaviours that
+have actually broken, and how to spot them:
+
+| Check | Expected | Symptom of a bug |
+|-------|----------|------------------|
+| Backup repo size | A few MB | Hundreds of MB → a large binary (`.app` bundle, downloaded CLI version) was committed |
+| `du -sh $CASB_BACKUP_ROOT/.git/objects/pack` | One `.pack` file | Many packs → git's automatic gc duplicated a blob per commit |
+| `ls $CASB_BACKUP_ROOT/.claude` | `home/ data/ root/` present | A multi-location agent's directory was pruned away |
+| `casb diff claude` | A handful of entries | Thousands of "added" files → the exclusion filter is not being applied to the diff |
+| `casb history claude` | Only claude's commits | Every agent's commits → the log is not scoped to the agent |
+| `casb stats` | `total: commits=N` equals the repo's commit count | A multiple of N → the shared repo's count is being summed per agent |
+| `casb list` | Only backed-up agents show a commit hash | Every agent shows one → the status is repo-global, not per agent |
+| `casb backup --parallel` | Exit 0, one commit per agent | `index.lock` errors → git operations ran concurrently on one index |
+| `casb restore <agent>` | Excluded paths survive | `projects/`, `history.jsonl` deleted → the restore used a different filter than the backup |
+
+### The restore check matters most
+
+A restore is the only command that writes to the live agent directories.
+Always confirm that the paths the backup excludes are still there after it:
+
+```bash
+export CASB_BACKUP_ROOT=/tmp/casb-test
+ls ~/.claude/projects > /tmp/before.txt
+casb restore claude --force
+ls ~/.claude/projects > /tmp/after.txt
+diff /tmp/before.txt /tmp/after.txt && echo "excluded paths intact"
 ```
 
 ---

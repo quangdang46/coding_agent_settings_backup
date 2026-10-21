@@ -216,6 +216,24 @@ pub fn backup_agents(
         }
         repo.clean_ignored()?;
 
+        // `git clean -fdX` removes a directory whose entire contents are
+        // gitignored, and rsync's pattern handling does not always agree
+        // with git's — so an excluded directory can survive the copy and be
+        // cleaned afterwards, taking its location directory with it.
+        // Re-create the location directories so the backup tree always
+        // shows where each agent's data lives.
+        for agent in agents.iter() {
+            for loc in agent.installed_locations() {
+                if !matches!(loc.kind, crate::agent::LocationKind::Directory) {
+                    continue;
+                }
+                let dest = crate::sync::backup_dest_for(&backup_root, loc);
+                if !dest.exists() {
+                    let _ = std::fs::create_dir_all(&dest);
+                }
+            }
+        }
+
         // Prune stale agent subdirs after all agents have synced. The set of
         // live directories is derived from *every installed agent*, not just
         // the ones in this run: backing up a single agent must not delete
@@ -501,6 +519,8 @@ mod tests {
         let backup_root = tempdir().unwrap();
         let src = tempdir().unwrap();
         std::fs::write(src.path().join("a.txt"), "hello").unwrap();
+        std::fs::create_dir_all(src.path().join("data")).unwrap();
+        std::fs::write(src.path().join("data/d.txt"), "data").unwrap();
         let cfg = cfg_for(backup_root.path());
 
         let agent = AgentConfig {
@@ -533,6 +553,34 @@ mod tests {
                 .join("a.txt")
                 .exists(),
             "multi-location agent data must survive the prune"
+        );
+        assert!(
+            backup_root.path().join(".claude").join("data").exists(),
+            "every location directory must survive the backup"
+        );
+    }
+
+    /// Regression: a location whose entire content is excluded must still
+    /// leave its directory in the backup tree. `git clean -fdX` removes
+    /// directories whose contents are all gitignored.
+    #[test]
+    fn location_directory_survives_fully_excluded_content() {
+        let backup_root = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("versions")).unwrap();
+        std::fs::write(src.path().join("versions/current.json"), "{}").unwrap();
+        let cfg = cfg_for(backup_root.path());
+        let agent = make_agent("excl", src.path());
+        let reg = registry_with(&agent);
+        backup_agents(&cfg, &reg, &["excl".into()], None, false, false).unwrap();
+
+        assert!(
+            backup_root.path().join(".excl").exists(),
+            "the agent's location directory must remain in the backup"
+        );
+        assert!(
+            !backup_root.path().join(".excl/versions").exists(),
+            "excluded content must not be in the backup"
         );
     }
 
