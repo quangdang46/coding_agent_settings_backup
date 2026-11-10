@@ -175,25 +175,33 @@ pub fn backup_agents(
             // exclusions existed, or anything excluded since it was first
             // backed up. `git rm --cached` keeps the worktree copy; the
             // staged deletion rides along in this agent's commit.
+            // Credential-shaped (and other newly-excluded) tracked files
+            // are always untracked — leaving them in the index would keep
+            // plaintext secrets in every future commit. This stages a
+            // deletion, which is correct regardless of auto_commit.
             let untrack_result = build_agent_filter(cfg, agent, &backup_root)
                 .and_then(|f| newly_excluded_tracked(&repo, agent, &f))
                 .and_then(|stale| repo.untrack_paths(&stale));
-            let stage_result = untrack_result.and_then(|_| {
-                repo.add_paths(&subdirs).and_then(|_| {
-                    let msg = message.map(|s| s.to_string()).unwrap_or_else(|| {
-                        format!(
-                            "casb backup {} at {}",
-                            agent.key,
-                            Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                        )
-                    });
-                    if cfg.general.auto_commit {
+            let stage_result = if cfg.general.auto_commit {
+                untrack_result.and_then(|_| {
+                    repo.add_paths(&subdirs).and_then(|_| {
+                        let msg = message.map(|s| s.to_string()).unwrap_or_else(|| {
+                            format!(
+                                "casb backup {} at {}",
+                                agent.key,
+                                Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                            )
+                        });
                         repo.commit(&msg)
-                    } else {
-                        Ok(false)
-                    }
+                    })
                 })
-            });
+            } else {
+                // auto_commit=false: do NOT stage synced files. Staged
+                // changes would be swept into the NEXT commit under a
+                // different agent's/message — misattribution. The synced
+                // files stay in the worktree for the user to commit.
+                untrack_result.map(|_| false)
+            };
             match stage_result {
                 Ok(was_committed) => {
                     committed = was_committed;
@@ -306,7 +314,29 @@ pub fn backup_agents(
             .flat_map(|a| a.installed_locations())
             .map(|l| top_level_subdir(&l.backup_subdir))
             .collect();
-        crate::sync::prune_stale_subdirs(&known_subdirs, &backup_root)?;
+        let pruned = crate::sync::prune_stale_subdirs(&known_subdirs, &backup_root)?;
+        if cfg.general.auto_commit {
+            // The repo-root .gitignore is rewritten every run — keep it
+            // tracked or the worktree is permanently dirty with `??`.
+            let _ = repo.add_paths(&[".gitignore".to_string()]);
+            // Stage and commit the pruned directories' deletions. Without
+            // this the removals sit in the worktree forever as unstaged
+            // changes — and the next agent's scoped `git add` would never
+            // pick them up.
+            if !pruned.is_empty() {
+                let _ = repo.add_paths_allow_missing(&pruned);
+            }
+            // commit() itself no-ops when nothing ended up staged, so an
+            // unchanged .gitignore and no prunes produces no empty commit.
+            let msg = if pruned.is_empty() {
+                "casb: update .gitignore"
+            } else {
+                "casb: prune stale agent directories"
+            };
+            if let Err(e) = repo.commit(msg) {
+                tracing::warn!("failed to commit repo housekeeping: {e}");
+            }
+        }
 
         repo.compact()?;
     }
@@ -422,10 +452,10 @@ fn location_relative_path(agent: &AgentConfig, repo_path: &str) -> Option<PathBu
             continue;
         }
         let prefix = format!("{sub}/");
-        if repo_path == sub || repo_path.starts_with(&prefix) {
-            if best.map(|(_, s)| sub.len() > s).unwrap_or(true) {
-                best = Some((loc, sub.len()));
-            }
+        if (repo_path == sub || repo_path.starts_with(&prefix))
+            && best.map(|(_, s)| sub.len() > s).unwrap_or(true)
+        {
+            best = Some((loc, sub.len()));
         }
     }
     let (loc, _) = best?;
@@ -830,7 +860,9 @@ mod tests {
             assert!(o.committed, "{} was not committed", o.agent);
         }
         let repo = Repo::new(backup_root.path());
-        assert_eq!(repo.commit_count().unwrap(), keys.len() as u64);
+        // One commit per agent, plus a possible housekeeping commit for the
+        // repo-root .gitignore on the first run.
+        assert!(repo.commit_count().unwrap() >= keys.len() as u64);
     }
 
     /// Regression: oversized files must never reach the backup repo. Agent
@@ -1015,5 +1047,82 @@ mod tests {
         assert!(outcomes[0].error.is_none());
         let tracked = tracked_files(backup_root.path(), ".sec2");
         assert!(tracked.contains("auth.json"), "{tracked}");
+    }
+
+    /// Regression (sync-robustness): `auto_commit = false` must not stage
+    /// files invisibly — staged changes would be swept into the NEXT
+    /// agent's commit under the wrong message. Files stay in the worktree
+    /// for the user to commit.
+    #[test]
+    fn auto_commit_false_leaves_index_clean() {
+        let backup_root = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), "x").unwrap();
+        let mut cfg = cfg_for(backup_root.path());
+        cfg.general.auto_commit = false;
+        let agent = make_agent("noauto", src.path());
+        let reg = registry_with(&agent);
+        let outcomes = backup_agents(&cfg, &reg, &["noauto".into()], None, false, false).unwrap();
+        assert!(!outcomes[0].committed);
+        // Synced file exists in the worktree but NOTHING is staged.
+        assert!(backup_root.path().join(".noauto/a.txt").exists());
+        let staged = std::process::Command::new("git")
+            .current_dir(backup_root.path())
+            .args(["diff", "--cached", "--name-only"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+            "auto_commit=false must not stage anything: {}",
+            String::from_utf8_lossy(&staged.stdout)
+        );
+    }
+
+    /// Regression (sync-robustness): pruning a stale agent directory must
+    /// stage+commit the deletion — otherwise the removal sits in the
+    /// worktree forever as unstaged changes no agent's scoped `git add`
+    /// will ever pick up.
+    #[test]
+    fn stale_agent_dir_prune_is_committed() {
+        let backup_root = tempdir().unwrap();
+        let src_old = tempdir().unwrap();
+        let src_new = tempdir().unwrap();
+        std::fs::write(src_old.path().join("old.txt"), "o").unwrap();
+        std::fs::write(src_new.path().join("new.txt"), "n").unwrap();
+        let cfg = cfg_for(backup_root.path());
+
+        let old_agent = make_agent("old", src_old.path());
+        let reg_old = registry_with(&old_agent);
+        backup_agents(&cfg, &reg_old, &["old".into()], None, false, false).unwrap();
+        assert!(backup_root.path().join(".old/old.txt").exists());
+
+        // Second backup knows only "new" — ".old" is now stale.
+        let new_agent = make_agent("new", src_new.path());
+        let reg_new = registry_with(&new_agent);
+        backup_agents(&cfg, &reg_new, &["new".into()], None, false, false).unwrap();
+
+        assert!(!backup_root.path().join(".old").exists());
+        assert!(backup_root.path().join(".new/new.txt").exists());
+        // The deletion must be committed, not left as an unstaged change.
+        let log = std::process::Command::new("git")
+            .current_dir(backup_root.path())
+            .args(["log", "--format=%s"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            log.contains("prune stale agent directories"),
+            "prune must be committed: {log}"
+        );
+        let status = std::process::Command::new("git")
+            .current_dir(backup_root.path())
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "worktree must be clean after prune commit: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
     }
 }

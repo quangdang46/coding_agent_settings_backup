@@ -117,26 +117,32 @@ fn write_tar<W: Write>(enc: GzEncoder<W>, repo_path: &Path, agent: &AgentConfig)
         });
     }
 
-    let mut tar = tar::Builder::new(enc);
-    // Store symlinks as symlinks rather than following them. Agent
-    // directories routinely contain "latest" pointers to files that have
-    // since been rotated away; following those dangling links makes tar
-    // fail with "No such file or directory" and aborts the whole export.
-    tar.follow_symlinks(false);
-    for sub in &present {
-        tar.append_dir_all(sub, repo_path.join(sub))?;
-    }
-    if repo_path.join(".git").exists() {
-        tar.append_dir_all(".git", repo_path.join(".git"))?;
-    }
-    let enc = tar.into_inner()?;
-    enc.finish()?;
+    // Build the archive inside a closure so that ANY failure still runs
+    // the cleanup below — a mid-archive error must not leave materialised
+    // directories behind in the user's backup working tree.
+    let build_result = (|| -> Result<()> {
+        let mut tar = tar::Builder::new(enc);
+        // Store symlinks as symlinks rather than following them. Agent
+        // directories routinely contain "latest" pointers to files that have
+        // since been rotated away; following those dangling links makes tar
+        // fail with "No such file or directory" and aborts the whole export.
+        tar.follow_symlinks(false);
+        for sub in &present {
+            tar.append_dir_all(sub, repo_path.join(sub))?;
+        }
+        if repo_path.join(".git").exists() {
+            tar.append_dir_all(".git", repo_path.join(".git"))?;
+        }
+        let enc = tar.into_inner()?;
+        enc.finish()?;
+        Ok(())
+    })();
     // Clean up directories we materialised from git so the backup working
-    // tree is left exactly as we found it.
+    // tree is left exactly as we found it — on success AND on error.
     for sub in &restored {
         let _ = std::fs::remove_dir_all(repo_path.join(sub));
     }
-    Ok(())
+    build_result
 }
 
 /// Whether `dir` contains no files at any depth (only subdirectories).

@@ -187,24 +187,59 @@ impl Repo {
         Ok(())
     }
 
-    /// Repack the repository into a single pack file.
+    /// Like [`Repo::add_paths`] but for paths that may no longer exist on
+    /// disk — `git add -A` still stages their deletions from the index.
+    /// Used after `prune_stale_subdirs` removes directories.
+    pub fn add_paths_allow_missing(&self, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec!["add", "-A", "--"];
+        args.extend(paths.iter().map(|s| s.as_str()));
+        match run_git_in(&self.path, &args) {
+            Ok(_) => Ok(()),
+            Err(CasbError::GitCommand { stderr, .. })
+                if stderr.contains("did not match any files") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Repack the repository, letting git's own heuristics decide whether
+    /// a repack is actually needed. A full `git gc` on every backup is
+    /// wasteful on large repos; `gc --auto` exits quickly when the loose-
+    /// object/pack thresholds aren't met. `gc.auto=0` (set at init) only
+    /// disables *unattended* auto-gc — an explicit `gc --auto` still
+    /// evaluates and repacks when warranted.
     ///
     /// Best-effort: a failure here never invalidates the backup itself.
     pub fn compact(&self) -> Result<()> {
-        let _ = run_git_in(&self.path, &["gc", "--quiet"]);
+        let _ = run_git_in(&self.path, &["gc", "--auto", "--quiet"]);
         Ok(())
     }
 
     /// Commit the staged changes with `message`. If there is nothing to
     /// commit, returns `Ok(false)` (no-op). Returns `Ok(true)` on success.
     pub fn commit(&self, message: &str) -> Result<bool> {
-        // `git diff --cached --quiet` exits 0 when no staged changes, 1 otherwise.
+        // `git diff --cached --quiet` exits 0 when no staged changes, 1 when
+        // there are staged changes, and >1 (typically 128) on real errors
+        // such as a corrupt index — which must NOT be mistaken for "has
+        // changes" and sent to `git commit`.
         let out = Command::new("git")
             .current_dir(&self.path)
             .args(["diff", "--cached", "--quiet"])
             .output()?;
-        if out.status.success() {
-            return Ok(false); // nothing to commit
+        match out.status.code() {
+            Some(0) => return Ok(false), // nothing to commit
+            Some(1) => {}                // staged changes exist — commit below
+            _ => {
+                return Err(CasbError::GitCommand {
+                    command: "git diff --cached --quiet".to_string(),
+                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                });
+            }
         }
         run_git_in(
             &self.path,

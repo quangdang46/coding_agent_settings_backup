@@ -52,8 +52,19 @@ pub fn sync_agent_to_backup(
         std::fs::create_dir_all(dest_root)?;
     }
 
-    for loc in agent.installed_locations() {
+    // Iterate ALL locations, not just installed ones: a File-kind location
+    // whose source was deleted must have its stale backup copy removed,
+    // or a later restore would resurrect a file the user deleted. Missing
+    // Directory locations keep their last backup (an uninstalled agent
+    // retains its history).
+    for loc in &agent.locations {
         let dest = backup_dest_for(dest_root, loc);
+        if !loc.path.exists() {
+            if matches!(loc.kind, LocationKind::File) && !dry_run && dest.exists() {
+                remove_file_and_empty_parents(&dest, dest_root)?;
+            }
+            continue;
+        }
         if !dry_run {
             // For File-kind locations, `dest` is the final file path -- we
             // must only ensure the parent directory exists, NOT create the
@@ -76,6 +87,25 @@ pub fn sync_agent_to_backup(
         total.merge(&stats);
     }
     Ok(total)
+}
+
+/// Remove `file` then prune any parent directories that became empty,
+/// stopping at `stop` (never removing `stop` itself or anything above it).
+fn remove_file_and_empty_parents(file: &Path, stop: &Path) -> Result<()> {
+    std::fs::remove_file(file)?;
+    let mut dir = file.parent();
+    while let Some(d) = dir {
+        if d == stop || !d.starts_with(stop) {
+            break;
+        }
+        // remove_dir only succeeds on empty directories, so this can never
+        // delete a sibling location's data.
+        if std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
+    Ok(())
 }
 
 /// Sync `dest_root` (a backup repo) back into the agent's source locations.
@@ -148,12 +178,16 @@ pub fn backup_dest_for(dest_root: &Path, loc: &AgentLocation) -> PathBuf {
 /// their locations one level deeper (`.claude/home`, `.claude/data`), so the
 /// caller must pass the first path component — passing the full subdirectory
 /// path would make every multi-location agent look stale and delete it.
+/// Returns the top-level directory names that were removed so the caller
+/// can stage/commit the deletions — an unstaged `remove_dir_all` would
+/// leave permanent dirty state in the shared repo.
 pub fn prune_stale_subdirs(
     known_subdirs: &std::collections::HashSet<String>,
     dest_root: &Path,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
     if !dest_root.exists() {
-        return Ok(());
+        return Ok(removed);
     }
 
     for entry in std::fs::read_dir(dest_root)? {
@@ -168,9 +202,10 @@ pub fn prune_stale_subdirs(
             && !known_subdirs.contains(&name_str)
         {
             std::fs::remove_dir_all(entry.path())?;
+            removed.push(name_str);
         }
     }
-    Ok(())
+    Ok(removed)
 }
 
 fn sync_location(
@@ -262,12 +297,23 @@ fn sync_file(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let bytes = std::fs::copy(src, dest)?;
+    let bytes = copy_preserving(src, dest)?;
     Ok(SyncStats {
         files_copied: 1,
         bytes_copied: bytes,
         ..Default::default()
     })
+}
+
+/// Copy `src` to `dest` preserving the source file's permission bits —
+/// `rsync -a` keeps modes, so the walkdir fallback must too or identical
+/// backups differ by backend (and executable bits are silently lost).
+fn copy_preserving(src: &Path, dest: &Path) -> Result<u64> {
+    let bytes = std::fs::copy(src, dest)?;
+    if let Ok(meta) = std::fs::metadata(src) {
+        let _ = std::fs::set_permissions(dest, meta.permissions());
+    }
+    Ok(bytes)
 }
 
 fn sync_rsync(
@@ -280,6 +326,10 @@ fn sync_rsync(
     use std::process::Command;
 
     let mut args = vec!["-a".to_string(), "--delete".to_string()];
+    // --stats makes rsync report exactly what it transferred; the old code
+    // counted every file in the destination and reported the whole tree
+    // size as "bytes copied" — fiction on every incremental backup.
+    args.push("--stats".to_string());
     if dry_run {
         args.push("--dry-run".to_string());
     }
@@ -328,19 +378,66 @@ fn sync_rsync(
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
     }
-    // rsync stats: count files copied via walkdir of dest (cheap relative to copy).
-    let files_copied = walkdir::WalkDir::new(dest)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .count();
-    let bytes_copied = util::dir_size(dest);
+    // Prefer rsync's own --stats numbers (files/bytes actually
+    // transferred). Fall back to measuring the destination tree when the
+    // stats block can't be parsed (older rsync, weird locale).
+    let (files_copied, bytes_copied) =
+        parse_rsync_stats(&out.stdout, &out.stderr).unwrap_or_else(|| {
+            let files = walkdir::WalkDir::new(dest)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .count();
+            (files, util::dir_size(dest))
+        });
     Ok(SyncStats {
         files_copied,
         bytes_copied,
         used_rsync: true,
         ..Default::default()
     })
+}
+
+/// Parse `rsync --stats` output for the number of files transferred and
+/// the total transferred byte size. Returns `None` when either figure is
+/// absent (stats format varies across rsync versions/platforms).
+fn parse_rsync_stats(stdout: &[u8], stderr: &[u8]) -> Option<(usize, u64)> {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    );
+    let mut files: Option<usize> = None;
+    let mut bytes: Option<u64> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        // "Number of files transferred: 12" / "Number of regular files
+        // transferred: 12" (wording differs across rsync versions).
+        if files.is_none() && line.contains("files transferred:") {
+            if let Some(n) = line
+                .rsplit(':')
+                .next()
+                .and_then(|s| s.trim().replace(',', "").parse::<usize>().ok())
+            {
+                files = Some(n);
+            }
+        }
+        // "Total transferred file size: 1,234 bytes"
+        if bytes.is_none() && line.contains("transferred file size:") {
+            if let Some(n) = line
+                .split(':')
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.replace(',', "").parse::<u64>().ok())
+            {
+                bytes = Some(n);
+            }
+        }
+        if files.is_some() && bytes.is_some() {
+            break;
+        }
+    }
+    Some((files?, bytes?))
 }
 
 /// Expand filter patterns into rsync `--exclude` arguments.
@@ -387,11 +484,19 @@ fn sync_walkdir(
 
     // Track all relative paths we copied; remove anything in dest not in this set.
     let mut kept: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // Excluded directories are pruned at the walkdir level (counted once
+    // each) instead of being traversed file-by-file — without this the
+    // fallback would descend entire node_modules/.venv trees only to skip
+    // every entry inside.
+    let pruned_dirs = std::cell::Cell::new(0usize);
 
     for entry in walkdir::WalkDir::new(src)
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
             // Never traverse into a `.git` directory or copy a `.git` file
             // from the source. The destination owns the only legitimate
             // `.git` (the backup repo metadata); pulling one in from the
@@ -400,7 +505,18 @@ fn sync_walkdir(
             //
             // Also skip `.gitignore` from source — the backup repo manages
             // its own `.gitignore` and source .gitignore may break git-add.
-            e.path() == src || (e.file_name() != ".git" && e.file_name() != ".gitignore")
+            if e.file_name() == ".git" || e.file_name() == ".gitignore" {
+                return false;
+            }
+            if e.file_type().is_dir() {
+                if let Ok(rel) = e.path().strip_prefix(src) {
+                    if filter.is_excluded(rel) {
+                        pruned_dirs.set(pruned_dirs.get() + 1);
+                        return false;
+                    }
+                }
+            }
+            true
         })
         .filter_map(|e| e.ok())
     {
@@ -424,6 +540,10 @@ fn sync_walkdir(
         if entry.file_type().is_dir() {
             if !dry_run {
                 std::fs::create_dir_all(&dest_path)?;
+                // Preserve directory mode bits too (rsync -a parity).
+                if let Ok(meta) = entry.metadata() {
+                    let _ = std::fs::set_permissions(&dest_path, meta.permissions());
+                }
             }
         } else if entry.file_type().is_symlink() {
             // Copy symlinks as symlinks, the way `rsync -a` does. Agent
@@ -450,11 +570,12 @@ fn sync_walkdir(
             if let Some(parent) = dest_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let bytes = std::fs::copy(entry.path(), &dest_path)?;
+            let bytes = copy_preserving(entry.path(), &dest_path)?;
             stats.files_copied += 1;
             stats.bytes_copied += bytes;
         }
     }
+    stats.files_skipped += pruned_dirs.get();
 
     if !dry_run && dest.exists() {
         if std::env::var("CASB_DEBUG_PRUNE").is_ok() {
@@ -787,5 +908,112 @@ mod tests {
             "LIVE-DATA",
             "root-level excluded file must survive rsync --delete"
         );
+    }
+
+    /// Regression (sync-robustness): excluded directories must be pruned
+    /// by walkdir's filter_entry — not descended into file-by-file. With
+    /// the old code every file inside an excluded dir was visited and
+    /// counted as skipped.
+    #[test]
+    fn walkdir_prunes_excluded_directories() {
+        let src = tempdir().unwrap();
+        let dest = tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("cache/nested")).unwrap();
+        for i in 0..5 {
+            std::fs::write(
+                src.path().join(format!("cache/nested/f{i}.bin")),
+                vec![0u8; 10],
+            )
+            .unwrap();
+        }
+        std::fs::write(src.path().join("keep.txt"), "k").unwrap();
+        let filter = ExclusionFilter::new(vec!["cache".into()]).unwrap();
+        let stats = sync_walkdir(
+            src.path(),
+            dest.path(),
+            &filter,
+            false,
+            SyncDirection::ToBackup,
+        )
+        .unwrap();
+        assert!(dest.path().join("keep.txt").exists());
+        assert!(!dest.path().join("cache").exists());
+        // The whole subtree counts as a single pruned entry, not 6 files.
+        assert_eq!(stats.files_skipped, 1);
+        assert_eq!(stats.files_copied, 1);
+    }
+
+    /// Regression (sync-robustness): a File-kind location whose source
+    /// file was deleted must have its stale backup copy removed —
+    /// otherwise a later restore resurrects a file the user deleted.
+    #[test]
+    fn deleted_file_location_is_pruned_from_backup() {
+        let src = tempdir().unwrap();
+        let dest = tempdir().unwrap();
+        let file_src = src.path().join("config.json");
+        std::fs::write(&file_src, "{}").unwrap();
+        let agent = AgentConfig {
+            key: "f".into(),
+            display_name: "F".into(),
+            category: crate::agent::AgentCategory::CliCoding,
+            locations: vec![AgentLocation {
+                path: file_src.clone(),
+                location_type: LocationType::HomeDir,
+                kind: LocationKind::File,
+                backup_subdir: ".f/root".into(),
+            }],
+        };
+        let filter = ExclusionFilter::new(vec![]).unwrap();
+        sync_agent_to_backup(&agent, dest.path(), &filter, false, false).unwrap();
+        assert!(dest.path().join(".f/root/config.json").exists());
+
+        std::fs::remove_file(&file_src).unwrap();
+        sync_agent_to_backup(&agent, dest.path(), &filter, false, false).unwrap();
+        assert!(!dest.path().join(".f/root/config.json").exists());
+    }
+
+    /// Regression (sync-robustness): the walkdir fallback must preserve
+    /// permission bits like `rsync -a` does — executable bits were
+    /// silently lost on non-rsync systems.
+    #[cfg(unix)]
+    #[test]
+    fn walkdir_preserves_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempdir().unwrap();
+        let dest = tempdir().unwrap();
+        let script = src.path().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let filter = ExclusionFilter::new(vec![]).unwrap();
+        sync_walkdir(
+            src.path(),
+            dest.path(),
+            &filter,
+            false,
+            SyncDirection::ToBackup,
+        )
+        .unwrap();
+        let mode = std::fs::metadata(dest.path().join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "executable bit must survive walkdir copy"
+        );
+    }
+
+    /// Unit test for the `rsync --stats` parser: both the classic
+    /// "Number of files transferred" and newer "Number of regular files
+    /// transferred" wordings, plus thousands separators in byte counts.
+    #[test]
+    fn parse_rsync_stats_reads_transfers() {
+        let out = b"Number of files: 10\nNumber of files transferred: 3\nTotal transferred file size: 1,234 bytes\n";
+        assert_eq!(parse_rsync_stats(out, b""), Some((3, 1234)));
+        let out2 =
+            b"Number of regular files transferred: 7\nTotal transferred file size: 42 bytes\n";
+        assert_eq!(parse_rsync_stats(b"", out2), Some((7, 42)));
+        assert_eq!(parse_rsync_stats(b"", b"no stats here"), None);
     }
 }

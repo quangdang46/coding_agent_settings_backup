@@ -76,23 +76,32 @@ pub fn build_preview(
     let tmp = tempfile::Builder::new().prefix("casb-restore-").tempdir()?;
     repo.worktree_add(tmp.path(), reference)?;
 
-    let mut preview = RestorePreview {
-        agent: agent.key.clone(),
-        ..Default::default()
-    };
-
-    for loc in &agent.locations {
-        let backup_dir = backup_dest_for(tmp.path(), loc);
-        let live = &loc.path;
-        // A single-file location has no relative path of its own; use the
-        // file name so the preview reports a meaningful path.
-        let start = match loc.kind {
-            LocationKind::File => live.file_name().map(PathBuf::from).unwrap_or_default(),
-            LocationKind::Directory => PathBuf::new(),
+    // If preview building fails, the worktree must still be removed —
+    // otherwise every failed restore leaks a registered worktree.
+    let tmp_path = tmp.path().to_path_buf();
+    let result = (|| -> Result<(RestorePreview, tempfile::TempDir)> {
+        let mut preview = RestorePreview {
+            agent: agent.key.clone(),
+            ..Default::default()
         };
-        compare_trees(&backup_dir, live, &start, filter, &mut preview)?;
+
+        for loc in &agent.locations {
+            let backup_dir = backup_dest_for(tmp.path(), loc);
+            let live = &loc.path;
+            // A single-file location has no relative path of its own; use the
+            // file name so the preview reports a meaningful path.
+            let start = match loc.kind {
+                LocationKind::File => live.file_name().map(PathBuf::from).unwrap_or_default(),
+                LocationKind::Directory => PathBuf::new(),
+            };
+            compare_trees(&backup_dir, live, &start, filter, &mut preview)?;
+        }
+        Ok((preview, tmp))
+    })();
+    if result.is_err() {
+        let _ = repo.worktree_remove(&tmp_path);
     }
-    Ok((preview, tmp))
+    result
 }
 
 fn compare_trees(
@@ -102,24 +111,27 @@ fn compare_trees(
     filter: &ExclusionFilter,
     preview: &mut RestorePreview,
 ) -> Result<()> {
-    let backup_exists = backup.exists();
-    let live_exists = live.exists();
-    if !backup_exists && !live_exists {
+    // Classify with symlink_metadata so symlinks are compared as links —
+    // never followed. Following a symlinked directory would let the
+    // comparison wander outside the agent tree.
+    let backup_kind = entry_kind(backup);
+    let live_kind = entry_kind(live);
+
+    if backup_kind == EntryKind::Missing && live_kind == EntryKind::Missing {
         return Ok(());
     }
 
-    if backup.is_file() || live.is_file() {
+    // File-level comparison (files, symlinks, and type mismatches).
+    if !matches!(backup_kind, EntryKind::Dir) || !matches!(live_kind, EntryKind::Dir) {
         let rel_str = rel.to_string_lossy().to_string();
-        if backup_exists && !live_exists {
-            preview.added.push(rel_str);
-        } else if !backup_exists && live_exists {
-            preview.removed.push(rel_str);
-        } else {
-            // Compare bytes.
-            let a = std::fs::read(backup).unwrap_or_default();
-            let b = std::fs::read(live).unwrap_or_default();
-            if a != b {
-                preview.modified.push(rel_str);
+        match (backup_kind, live_kind) {
+            (EntryKind::Missing, _) => preview.removed.push(rel_str),
+            (_, EntryKind::Missing) => preview.added.push(rel_str),
+            (EntryKind::Dir, EntryKind::Dir) => unreachable!(),
+            _ => {
+                if entries_differ(backup, backup_kind, live, live_kind) {
+                    preview.modified.push(rel_str);
+                }
             }
         }
         return Ok(());
@@ -127,20 +139,15 @@ fn compare_trees(
 
     // Directory comparison.
     let mut names: std::collections::BTreeSet<std::ffi::OsString> = Default::default();
-    if backup_exists {
-        for entry in std::fs::read_dir(backup)? {
-            let entry = entry?;
-            names.insert(entry.file_name());
-        }
-    }
-    if live_exists {
-        for entry in std::fs::read_dir(live)? {
-            let entry = entry?;
-            // Skip .git inside the backup tree to avoid noise.
-            if entry.file_name() == ".git" {
-                continue;
+    for base in [backup, live] {
+        if let Ok(rd) = std::fs::read_dir(base) {
+            for entry in rd.flatten() {
+                // Skip .git inside the backup tree to avoid noise.
+                if entry.file_name() == ".git" {
+                    continue;
+                }
+                names.insert(entry.file_name());
             }
-            names.insert(entry.file_name());
         }
     }
     for name in names {
@@ -163,6 +170,73 @@ fn compare_trees(
         )?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Missing,
+    Dir,
+    File,
+    Symlink,
+    Other,
+}
+
+fn entry_kind(path: &Path) -> EntryKind {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => EntryKind::Symlink,
+        Ok(m) if m.is_dir() => EntryKind::Dir,
+        Ok(m) if m.is_file() => EntryKind::File,
+        Ok(_) => EntryKind::Other,
+        Err(_) => EntryKind::Missing,
+    }
+}
+
+/// Do two existing entries differ? Symlinks compare by link target;
+/// everything else compares by length first, then chunked content.
+fn entries_differ(a: &Path, a_kind: EntryKind, b: &Path, b_kind: EntryKind) -> bool {
+    if a_kind != b_kind {
+        return true;
+    }
+    match a_kind {
+        EntryKind::Symlink => std::fs::read_link(a).ok() != std::fs::read_link(b).ok(),
+        EntryKind::File => files_differ(a, b),
+        // Same non-file, non-symlink kind (e.g. fifo vs fifo): can't cheaply
+        // compare, treat as equal to avoid phantom diffs.
+        _ => false,
+    }
+}
+
+/// Length-first file comparison: metadata check avoids reading two whole
+/// files into memory when sizes already differ; equal sizes then compare
+/// in 64 KiB chunks so large files never fully materialise either.
+fn files_differ(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return true;
+    };
+    if ma.len() != mb.len() {
+        return true;
+    }
+    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return true;
+    };
+    use std::io::Read;
+    let mut ba = [0u8; 65536];
+    let mut bb = [0u8; 65536];
+    loop {
+        let na = match fa.read(&mut ba) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return true,
+        };
+        let nb = match fb.read(&mut bb) {
+            Ok(n) => n,
+            Err(_) => return true,
+        };
+        if na != nb || ba[..na] != bb[..nb] {
+            return true;
+        }
+    }
+    false
 }
 
 /// Execute a restore: build preview, prompt, then sync.
@@ -204,17 +278,27 @@ pub fn restore_agent(
         return Err(CasbError::Cancelled);
     }
 
-    // Pre-restore hooks.
-    run_hooks(HookKind::PreRestore, &agent.key)?;
     // The same filter that produced the backup is used here so that the
     // restore never deletes excluded paths from the live source directory.
-    let stats = sync_backup_to_agent(agent, &target_path, &filter, cfg.backup.use_rsync, false)?;
-    run_hooks(HookKind::PostRestore, &agent.key)?;
-    repo.worktree_remove(&target_path)?;
+    // worktree_remove runs on EVERY path — success or failure — so a
+    // failed sync/hook never leaks a registered worktree.
+    let sync_result = (|| -> Result<SyncStats> {
+        run_hooks(HookKind::PreRestore, &agent.key)?;
+        let stats =
+            sync_backup_to_agent(agent, &target_path, &filter, cfg.backup.use_rsync, false)?;
+        run_hooks(HookKind::PostRestore, &agent.key)?;
+        Ok(stats)
+    })();
+    let remove_result = repo.worktree_remove(&target_path);
 
-    outcome.sync = stats;
-    outcome.applied = true;
-    Ok((preview, outcome))
+    match (sync_result, remove_result) {
+        (Ok(stats), Ok(())) => {
+            outcome.sync = stats;
+            outcome.applied = true;
+            Ok((preview, outcome))
+        }
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    }
 }
 
 #[cfg(test)]
