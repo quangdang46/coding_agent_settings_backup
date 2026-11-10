@@ -578,8 +578,11 @@ fn cmd_tag(
         TagAction::Restore { agent, name } => {
             let a = registry.get(&agent)?;
             require_confirmation_mode(p, force, dry_run, "tag restore")?;
+            // Tags are stored namespaced as `<agent>/<name>`; resolve the
+            // user-facing bare name to the scoped git ref.
+            let scoped = tag::scoped_name(&a.key, &name);
             let (preview, outcome) =
-                match restore::restore_agent(cfg, a, Some(&name), force, dry_run) {
+                match restore::restore_agent(cfg, a, Some(&scoped), force, dry_run) {
                     Ok(v) => v,
                     Err(CasbError::Cancelled) => {
                         p.text_line("restore cancelled")?;

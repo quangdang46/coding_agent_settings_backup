@@ -27,7 +27,17 @@ pub fn agent_history(cfg: &Config, agent: &AgentConfig, limit: usize) -> Result<
     // agent's own directories. An unscoped `git log` would list every other
     // agent's commits as this agent's history.
     let subdirs = vec![agent.backup_root_subdir()];
-    let entries = repo.log_for_paths(limit, &subdirs)?;
+    let mut entries = repo.log_for_paths(limit, &subdirs)?;
+    // Tags are stored namespaced as `<agent>/<name>`; show the bare name
+    // for this agent's own tags and leave other agents' tags qualified.
+    let own_prefix = format!("{}/", agent.key);
+    for e in entries.iter_mut() {
+        for t in e.tags.iter_mut() {
+            if let Some(stripped) = t.strip_prefix(&own_prefix) {
+                *t = stripped.to_string();
+            }
+        }
+    }
     Ok(History {
         agent: agent.key.clone(),
         count: entries.len(),

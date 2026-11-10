@@ -82,6 +82,11 @@ pub fn backup_agents(
         let repo = Repo::new(&backup_root);
         if !repo.exists() {
             repo.init()?;
+        } else {
+            // Repos created before the safety pins existed (or restored
+            // from an archive, whose sanitizer strips the pins) still get
+            // global-config protection on every backup.
+            repo.pin_safe_git_config()?;
         }
         // Refresh the repo's .gitignore every run so that newly added
         // exclusion patterns take effect on an existing backup repo.
@@ -275,7 +280,7 @@ fn top_level_subdir(subdir: &str) -> String {
 }
 
 /// The top-level backup directories an agent occupies.
-fn agent_backup_subdirs(agent: &AgentConfig) -> Vec<String> {
+pub(crate) fn agent_backup_subdirs(agent: &AgentConfig) -> Vec<String> {
     let mut dirs: Vec<String> = Vec::new();
     for loc in &agent.locations {
         let top = top_level_subdir(&loc.backup_subdir);
@@ -382,6 +387,9 @@ pub fn require_repo(cfg: &Config) -> Result<Repo> {
             key: "backup root".into(),
         });
     }
+    // Repos created before the safety pins existed (or restored from an
+    // older archive) still get global-config protection on every command.
+    repo.pin_safe_git_config()?;
     Ok(repo)
 }
 

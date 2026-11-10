@@ -25,6 +25,18 @@ impl Repo {
         self.path.join(".git").exists()
     }
 
+    /// Whether git can read the repository at `self.path`
+    /// (`git rev-parse --git-dir` succeeds). Used to validate archives
+    /// before they are allowed to replace the backup root.
+    pub fn is_valid_repo(&self) -> bool {
+        Command::new("git")
+            .current_dir(&self.path)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     /// Initialize a new git repository at `self.path`. Creates the
     /// directory (and intermediate dirs) if missing. The default branch is
     /// `main`. Idempotent.
@@ -34,6 +46,7 @@ impl Repo {
             return Ok(());
         }
         run_git_in(&self.path, &["init", "-q", "-b", "main"])?;
+        self.pin_safe_git_config()?;
         // Disable git's automatic garbage collection. `casb` commits once per
         // agent, and every `git commit` would otherwise spawn a background
         // `git gc --auto`. Those concurrent repacks each write their own pack
@@ -41,6 +54,42 @@ impl Repo {
         // agent and the repo grows by a multiple of its real size. `casb`
         // runs a single controlled `git gc` at the end of a backup instead.
         run_git_in(&self.path, &["config", "gc.auto", "0"])?;
+        Ok(())
+    }
+
+    /// Pin repository-local config so casb's git operations cannot be
+    /// hijacked or broken by the user's *global* git configuration:
+    ///
+    /// - `core.hooksPath` → an empty directory inside `.git`. Without this,
+    ///   a global `core.hooksPath` injects arbitrary hooks into every casb
+    ///   commit/checkout/worktree operation.
+    /// - `core.fsmonitor` → `false`. A global fsmonitor hook is a command
+    ///   git executes on many operations.
+    /// - `commit.gpgsign` / `tag.gpgsign` → `false`. Global signing config
+    ///   makes every casb commit/tag attempt GPG signing, which fails or
+    ///   hangs in non-interactive use.
+    ///
+    /// Idempotent; safe to call on every command. Local config wins over
+    /// global, and the per-command `-c` overrides in [`Repo::commit`] and
+    /// [`Repo::tag_create_at`] guard even against a poisoned local config.
+    pub fn pin_safe_git_config(&self) -> Result<()> {
+        if !self.exists() {
+            return Ok(());
+        }
+        // Only pre-create the directory when `.git` is a real directory;
+        // for a gitfile (linked worktree) the path simply won't resolve,
+        // which is equally safe — git finds no hooks there.
+        let dotgit = self.path.join(".git");
+        if dotgit.is_dir() {
+            std::fs::create_dir_all(dotgit.join("casb-empty-hooks"))?;
+        }
+        run_git_in(
+            &self.path,
+            &["config", "core.hooksPath", ".git/casb-empty-hooks"],
+        )?;
+        run_git_in(&self.path, &["config", "core.fsmonitor", "false"])?;
+        run_git_in(&self.path, &["config", "commit.gpgsign", "false"])?;
+        run_git_in(&self.path, &["config", "tag.gpgsign", "false"])?;
         Ok(())
     }
 
@@ -109,6 +158,8 @@ impl Repo {
                 "user.email=casb@local",
                 "-c",
                 "user.name=casb",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "-q",
                 "-m",
@@ -120,6 +171,12 @@ impl Repo {
 
     /// Force-create a tag at HEAD with optional annotated message.
     pub fn tag_create(&self, name: &str, message: Option<&str>) -> Result<()> {
+        self.tag_create_at(name, message, "HEAD")
+    }
+
+    /// Force-create a tag at an explicit target (commit-ish) with an
+    /// optional annotated message.
+    pub fn tag_create_at(&self, name: &str, message: Option<&str>, target: &str) -> Result<()> {
         match message {
             Some(msg) => {
                 run_git_in(
@@ -129,17 +186,23 @@ impl Repo {
                         "user.email=casb@local",
                         "-c",
                         "user.name=casb",
+                        "-c",
+                        "tag.gpgsign=false",
                         "tag",
                         "-a",
                         name,
                         "-m",
                         msg,
                         "-f",
+                        target,
                     ],
                 )?;
             }
             None => {
-                run_git_in(&self.path, &["tag", name, "-f"])?;
+                run_git_in(
+                    &self.path,
+                    &["-c", "tag.gpgsign=false", "tag", name, "-f", target],
+                )?;
             }
         }
         Ok(())
