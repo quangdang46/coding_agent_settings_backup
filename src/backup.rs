@@ -593,26 +593,19 @@ fn write_default_gitignore(
     if path.exists() {
         existing = std::fs::read_to_string(&path)?;
     }
-    let mut lines: Vec<String> = existing.lines().map(|s| s.to_string()).collect();
     let defaults = crate::config::default_exclusions();
+    let secret_pats = crate::config::default_secret_patterns();
     // Secret patterns go into .gitignore too (when secrets are excluded) so
     // a file that was committed before the exclusion existed — or one that
     // appears by some other route — is never re-tracked. `**/name` gitignore
     // syntax matches at any depth, same as the filter.
-    let secrets = if include_secrets {
-        Vec::new()
-    } else {
-        crate::config::default_secret_patterns()
-    };
-    for pat in defaults.iter().chain(extras.iter()).chain(secrets.iter()) {
-        if !lines.iter().any(|l| l.trim() == pat.trim()) {
-            lines.push(pat.clone());
-        }
-    }
+    let secrets: &[String] = if include_secrets { &[] } else { &secret_pats };
+
     // Agent-scoped patterns must be prefixed with each location's
     // backup_subdir — written unprefixed they would ignore e.g.
     // `package.json` under EVERY agent's tree even though only OpenCode's
     // filter excludes it.
+    let mut scoped: Vec<String> = Vec::new();
     for agent in agents {
         let pats = crate::config::agent_exclusions(&agent.key);
         if pats.is_empty() {
@@ -629,11 +622,43 @@ fn write_default_gitignore(
         for sub in subs {
             for pat in &pats {
                 let stripped = pat.strip_prefix("**/").unwrap_or(pat);
-                let scoped = format!("{sub}/**/{stripped}");
-                if !lines.iter().any(|l| l.trim() == scoped) {
-                    lines.push(scoped);
-                }
+                scoped.push(format!("{sub}/**/{stripped}"));
             }
+        }
+    }
+    scoped.sort();
+    scoped.dedup();
+
+    // The file is fully managed EXCEPT for lines the user added by hand.
+    // Previously-managed lines must be REMOVED when they no longer apply —
+    // e.g. flipping `backup.include_secrets` back to true has to drop the
+    // secret patterns, or the opt-in silently keeps ignoring them (and
+    // `git clean -fdX` then deletes the worktree copies). Purge every line
+    // casb could have written (current managed set PLUS the secret set,
+    // which is only conditionally written) and keep the rest.
+    let managed_all: std::collections::HashSet<&str> = defaults
+        .iter()
+        .chain(extras.iter())
+        .chain(secret_pats.iter())
+        .chain(scoped.iter())
+        .map(|s| s.trim())
+        .collect();
+    let mut lines: Vec<String> = existing
+        .lines()
+        .map(|s| s.to_string())
+        .filter(|l| {
+            let t = l.trim();
+            t.is_empty() || t.starts_with('#') || !managed_all.contains(t)
+        })
+        .collect();
+    for pat in defaults
+        .iter()
+        .chain(extras.iter())
+        .chain(secrets.iter())
+        .chain(scoped.iter())
+    {
+        if !lines.iter().any(|l| l.trim() == pat.trim()) {
+            lines.push(pat.clone());
         }
     }
     let body = lines.join("\n") + "\n";
