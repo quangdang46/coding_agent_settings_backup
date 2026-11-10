@@ -99,13 +99,35 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 struct Envelope<T: Serialize> {
     ok: bool,
     command: &'static str,
+    /// Populated only when the command partially or wholly failed, so robot
+    /// consumers get the failure reasons without digging through `data`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<String>,
+    /// Non-fatal warnings, when the command produces any.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
     data: T,
 }
 
+/// Emit a successful envelope (`ok: true`, no errors/warnings).
 fn emit_data<T: Serialize>(p: &mut Printer, command: &'static str, data: T) -> Result<()> {
+    emit_envelope(p, command, true, &[], &[], data)
+}
+
+/// Emit an envelope with an explicit `ok` flag plus error/warning lists.
+fn emit_envelope<T: Serialize>(
+    p: &mut Printer,
+    command: &'static str,
+    ok: bool,
+    errors: &[String],
+    warnings: &[String],
+    data: T,
+) -> Result<()> {
     let env = Envelope {
-        ok: true,
+        ok,
         command,
+        errors: errors.to_vec(),
+        warnings: warnings.to_vec(),
         data,
     };
     p.emit(&env)
@@ -146,7 +168,11 @@ fn cmd_backup(
     // hook chains can detect them. The per-agent error messages have already
     // been printed above; the envelope still carries the full outcome list.
     let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
-    emit_data(p, "backup", &outcomes)?;
+    let errors: Vec<String> = outcomes
+        .iter()
+        .filter_map(|o| o.error.as_ref().map(|e| format!("{}: {e}", o.agent)))
+        .collect();
+    emit_envelope(p, "backup", failed == 0, &errors, &[], &outcomes)?;
     if failed > 0 {
         return Err(CasbError::BackupFailed { count: failed });
     }
@@ -385,7 +411,17 @@ fn cmd_verify(cfg: &Config, registry: &Registry, p: &mut Printer, keys: &[String
         };
         p.text_line(&format!("{mark} {} — {suffix}", entry.agent))?;
     }
-    emit_data(p, "verify", &report)?;
+    let errors: Vec<String> = report
+        .agents
+        .iter()
+        .flat_map(|a| a.errors.iter().map(|e| format!("{}: {e}", a.agent)))
+        .collect();
+    let warnings: Vec<String> = report
+        .agents
+        .iter()
+        .flat_map(|a| a.warnings.iter().map(|w| format!("{}: {w}", a.agent)))
+        .collect();
+    emit_envelope(p, "verify", report.all_ok, &errors, &warnings, &report)?;
     if !report.all_ok {
         return Err(CasbError::other("one or more verify checks failed"));
     }
@@ -590,7 +626,16 @@ fn cmd_doctor(cfg: &Config, registry: &Registry, p: &mut Printer) -> Result<()> 
     } else {
         "doctor: failures present"
     })?;
-    emit_data(p, "doctor", &report)?;
+    let errors: Vec<String> = report
+        .checks
+        .iter()
+        .filter(|c| !c.ok)
+        .map(|c| match &c.detail {
+            Some(d) => format!("{}: {d}", c.name),
+            None => c.name.clone(),
+        })
+        .collect();
+    emit_envelope(p, "doctor", report.all_ok, &errors, &[], &report)?;
     if !report.all_ok {
         return Err(CasbError::other("doctor reported failures"));
     }
