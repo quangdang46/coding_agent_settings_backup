@@ -40,7 +40,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     let mut printer = Printer::new(format, cli.quiet, cli.verbose);
 
     match cli.command {
-        Command::Init { root } => cmd_init(&cfg, &mut printer, root.as_deref()),
+        Command::Init { root } => cmd_init(&cfg, &mut printer, root.as_deref(), cli.dry_run),
         Command::Backup {
             agents,
             message,
@@ -66,7 +66,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Export { agent, file } => {
             cmd_export(&cfg, &registry, &mut printer, &agent, file.as_deref())
         }
-        Command::Import { file } => cmd_import(&cfg, &mut printer, file.as_deref()),
+        Command::Import { file } => {
+            cmd_import(&cfg, &mut printer, file.as_deref(), cli.dry_run)
+        }
         Command::List => cmd_list(&cfg, &registry, &mut printer),
         Command::History { agent, limit } => {
             cmd_history(&cfg, &registry, &mut printer, &agent, limit)
@@ -83,10 +85,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         ),
         Command::Stats { agent } => cmd_stats(&cfg, &registry, &mut printer, agent.as_deref()),
         Command::Discover { list_only } => cmd_discover(&registry, &mut printer, list_only),
-        Command::Schedule { action } => cmd_schedule(&mut printer, action),
+        Command::Schedule { action } => cmd_schedule(&mut printer, action, cli.dry_run),
         Command::Hooks { action } => cmd_hooks(&mut printer, action),
         Command::Doctor => cmd_doctor(&cfg, &registry, &mut printer),
-        Command::Config { action } => cmd_config(cfg, cli.config.clone(), &mut printer, action),
+        Command::Config { action } => {
+            cmd_config(cfg, cli.config.clone(), &mut printer, action, cli.dry_run)
+        }
         Command::Completion { shell } => cmd_completion(&mut printer, shell),
         Command::Version => {
             // Already handled above, but keep exhaustive match.
@@ -135,7 +139,30 @@ fn emit_envelope<T: Serialize>(
 
 // ----- init -----
 
-fn cmd_init(cfg: &Config, p: &mut Printer, root: Option<&std::path::Path>) -> Result<()> {
+fn cmd_init(
+    cfg: &Config,
+    p: &mut Printer,
+    root: Option<&std::path::Path>,
+    dry_run: bool,
+) -> Result<()> {
+    // Resolve the target root the same way `init_backup_root` does so the
+    // dry-run preview reports the real destination.
+    let resolved = match root {
+        Some(r) => crate::util::expand_tilde(r),
+        None => cfg.backup_root(),
+    };
+    if dry_run {
+        p.text_line(&format!(
+            "dry-run: would initialise backup root at {}",
+            resolved.display()
+        ))?;
+        emit_data(
+            p,
+            "init",
+            serde_json::json!({"backup_root": resolved.display().to_string(), "dry_run": true}),
+        )?;
+        return Ok(());
+    }
     let root = backup::init_backup_root(cfg, root)?;
     p.text_line(&format!("initialised backup root at {}", root.display()))?;
     emit_data(
@@ -270,7 +297,28 @@ fn cmd_export(
     Ok(())
 }
 
-fn cmd_import(cfg: &Config, p: &mut Printer, src: Option<&str>) -> Result<()> {
+fn cmd_import(cfg: &Config, p: &mut Printer, src: Option<&str>, dry_run: bool) -> Result<()> {
+    if dry_run {
+        // Validate the archive is a readable gzip+tar and report what would
+        // be unpacked — without writing anything to the backup root.
+        let entries = inspect_archive_entries(src)?;
+        let dest = cfg.backup_root();
+        p.text_line(&format!(
+            "dry-run: would import {} entries from archive into {}",
+            entries,
+            dest.display()
+        ))?;
+        emit_data(
+            p,
+            "import",
+            serde_json::json!({
+                "backup_root": dest.display().to_string(),
+                "entries": entries,
+                "dry_run": true,
+            }),
+        )?;
+        return Ok(());
+    }
     let dest = export::import_archive(cfg, src)?;
     p.text_line(&format!("imported into {}", dest.display()))?;
     emit_data(
@@ -278,6 +326,36 @@ fn cmd_import(cfg: &Config, p: &mut Printer, src: Option<&str>) -> Result<()> {
         "import",
         serde_json::json!({"backup_root": dest.display().to_string()}),
     )
+}
+
+/// Count the entries in a tar.gz archive without extracting it.
+/// `src` follows the same convention as [`export::import_archive`]:
+/// `None`/`Some("-")` reads stdin, anything else is a file path.
+fn inspect_archive_entries(src: Option<&str>) -> Result<usize> {
+    use flate2::read::GzDecoder;
+
+    let stdin_mode = matches!(src, None | Some("-"));
+    let mut count = 0usize;
+    if stdin_mode {
+        let stdin = std::io::stdin();
+        let lock = stdin.lock();
+        let dec = GzDecoder::new(lock);
+        let mut ar = tar::Archive::new(dec);
+        for entry in ar.entries()? {
+            let _ = entry?;
+            count += 1;
+        }
+    } else {
+        let path = crate::util::expand_tilde(src.unwrap_or_default());
+        let file = std::fs::File::open(&path)?;
+        let dec = GzDecoder::new(file);
+        let mut ar = tar::Archive::new(dec);
+        for entry in ar.entries()? {
+            let _ = entry?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 // ----- list -----
@@ -544,7 +622,7 @@ fn cmd_discover(registry: &Registry, p: &mut Printer, _list_only: bool) -> Resul
 
 // ----- schedule -----
 
-fn cmd_schedule(p: &mut Printer, action: ScheduleAction) -> Result<()> {
+fn cmd_schedule(p: &mut Printer, action: ScheduleAction, dry_run: bool) -> Result<()> {
     match action {
         ScheduleAction::Status => {
             let s = schedule::status()?;
@@ -565,6 +643,22 @@ fn cmd_schedule(p: &mut Printer, action: ScheduleAction) -> Result<()> {
                 None => schedule::Method::platform_default(),
             };
             let i = schedule::Interval::parse(&interval)?;
+            if dry_run {
+                let method_label = format!("{m:?}").to_lowercase();
+                p.text_line(&format!(
+                    "dry-run: would install {method_label} schedule ({interval})"
+                ))?;
+                emit_data(
+                    p,
+                    "schedule-install",
+                    serde_json::json!({
+                        "method": method_label,
+                        "interval": interval,
+                        "dry_run": true,
+                    }),
+                )?;
+                return Ok(());
+            }
             schedule::install(m, i)?;
             let method_label = format!("{m:?}").to_lowercase();
             p.text_line(&format!("installed {method_label} schedule ({interval})"))?;
@@ -575,6 +669,19 @@ fn cmd_schedule(p: &mut Printer, action: ScheduleAction) -> Result<()> {
             )
         }
         ScheduleAction::Remove => {
+            if dry_run {
+                let s = schedule::status()?;
+                p.text_line(&format!(
+                    "dry-run: would remove schedule (currently {})",
+                    if s.installed { "installed" } else { "not installed" }
+                ))?;
+                emit_data(
+                    p,
+                    "schedule-remove",
+                    serde_json::json!({"dry_run": true, "was_installed": s.installed}),
+                )?;
+                return Ok(());
+            }
             schedule::remove()?;
             p.text_line("schedule removed")?;
             emit_data(p, "schedule-remove", serde_json::json!({}))
@@ -649,6 +756,7 @@ fn cmd_config(
     explicit_path: Option<std::path::PathBuf>,
     p: &mut Printer,
     action: ConfigAction,
+    dry_run: bool,
 ) -> Result<()> {
     let path = match explicit_path {
         Some(x) => x,
@@ -678,7 +786,18 @@ fn cmd_config(
             ))),
         },
         ConfigAction::Set { key, value } => {
+            // Validate the key/value pair against the typed setter first so
+            // a bad value fails before anything touches the file.
             cfg.set_dotted(&key, &value)?;
+            if dry_run {
+                p.text_line(&format!("dry-run: would set {key} = {value}"))?;
+                emit_data(
+                    p,
+                    "config-set",
+                    serde_json::json!({"key": key, "value": value, "dry_run": true}),
+                )?;
+                return Ok(());
+            }
             cfg.save_to(&path)?;
             p.text_line(&format!("set {key} = {value}"))?;
             emit_data(
@@ -688,7 +807,13 @@ fn cmd_config(
             )
         }
         ConfigAction::Init => {
-            if path.exists() {
+            if dry_run {
+                p.text_line(&format!(
+                    "dry-run: would {} config at {}",
+                    if path.exists() { "keep existing" } else { "write default" },
+                    path.display()
+                ))?;
+            } else if path.exists() {
                 p.text_line(&format!("config exists at {}", path.display()))?;
             } else {
                 cfg.save_to(&path)?;

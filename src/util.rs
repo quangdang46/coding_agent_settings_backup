@@ -102,6 +102,47 @@ pub fn run_capture<S: AsRef<OsStr>>(program: S, args: &[&str]) -> Result<Output>
     Ok(output)
 }
 
+/// Run a subprocess with a timeout, returning captured [`Output`].
+///
+/// stdin is connected to `/dev/null` so the child can never block waiting
+/// for interactive input. If the process does not exit within `timeout`
+/// it is killed and a [`CasbError::CommandFailed`] error is returned —
+/// used for invocations that may hang indefinitely (e.g. `crontab`).
+pub fn run_capture_timeout<S: AsRef<OsStr>>(
+    program: S,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<Output> {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let mut child = Command::new(program.as_ref())
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(_) => return Ok(child.wait_with_output()?),
+            None => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let mut argv = vec![program.as_ref().to_string_lossy().into_owned()];
+                    argv.extend(args.iter().map(|s| (*s).to_owned()));
+                    return Err(CasbError::CommandFailed {
+                        command: argv.join(" "),
+                        stderr: format!("timed out after {}s", timeout.as_secs()),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 /// Run a subprocess and return its captured stdout as a string.
 ///
 /// Fails with [`CasbError::CommandFailed`] on non-zero exit status.

@@ -5,9 +5,10 @@
 //! interval; both can be removed cleanly without affecting other entries.
 
 use crate::error::{CasbError, Result};
-use crate::util::{home_dir, run_capture, which};
+use crate::util::{home_dir, run_capture, run_capture_timeout, which};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 /// Supported backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -102,6 +103,10 @@ pub struct ScheduleStatus {
 const SYSTEMD_SERVICE_NAME: &str = "casb-backup.service";
 const SYSTEMD_TIMER_NAME: &str = "casb-backup.timer";
 const CRON_TAG: &str = "# managed-by: casb";
+/// Upper bound for any single `crontab` invocation. `crontab` is a local
+/// operation and should finish in milliseconds; the timeout only exists so
+/// a misbehaving crontab can never hang `casb schedule` forever.
+const CRONTAB_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Install a schedule with the chosen `method` and `interval`.
 pub fn install(method: Method, interval: Interval) -> Result<()> {
@@ -265,7 +270,7 @@ fn read_crontab() -> Result<String> {
     if !which("crontab") {
         return Ok(String::new());
     }
-    let out = run_capture("crontab", &["-l"])?;
+    let out = run_capture_timeout("crontab", &["-l"], CRONTAB_TIMEOUT)?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -276,24 +281,22 @@ fn read_crontab() -> Result<String> {
 
 fn write_crontab(content: &str) -> Result<()> {
     use std::io::Write;
-    use std::process::Stdio;
-    let mut child = Command::new("crontab")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let mut body = content.to_string();
-        if !body.ends_with('\n') {
-            body.push('\n');
-        }
-        stdin.write_all(body.as_bytes())?;
+    // Feed crontab via a temp file (`crontab file`) rather than `crontab -`:
+    // the `-` operand is not portable — BSD/macOS crontab does not document
+    // it — and a crontab that falls back to reading the terminal would
+    // block forever. The file is deleted when `tmp` drops after the call.
+    let mut tmp = tempfile::NamedTempFile::new()?;
+    let mut body = content.to_string();
+    if !body.ends_with('\n') {
+        body.push('\n');
     }
-    let out = child.wait_with_output()?;
+    tmp.write_all(body.as_bytes())?;
+    tmp.flush()?;
+    let path_arg = tmp.path().to_string_lossy().into_owned();
+    let out = run_capture_timeout("crontab", &[path_arg.as_str()], CRONTAB_TIMEOUT)?;
     if !out.status.success() {
         return Err(CasbError::CommandFailed {
-            command: "crontab -".into(),
+            command: "crontab <file>".into(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
     }
