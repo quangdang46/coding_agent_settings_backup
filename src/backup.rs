@@ -188,7 +188,14 @@ pub fn backup_agents(
         };
 
         if !dry_run && error.is_none() {
-            run_hooks(HookKind::PostBackup, &agent.key)?;
+            // Post-backup hooks are advisory: a failing hook must not
+            // abort the remaining agents or skip the Phase-3 cleanup
+            // (clean_ignored, location re-create, prune, compact). Record
+            // it on the outcome like any other per-agent failure so the
+            // command still reports non-zero for this agent.
+            if let Err(e) = run_hooks(HookKind::PostBackup, &agent.key) {
+                error = Some(format!("post-backup hook failed: {e}"));
+            }
         }
 
         if !phase.installed && error.is_none() {

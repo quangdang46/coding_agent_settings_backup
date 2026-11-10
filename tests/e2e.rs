@@ -837,3 +837,84 @@ fn portable_export_import_round_trip() {
     env2.casb().arg("import").arg(&archive).assert().success();
     assert!(env2.backup_root.join(".git").exists());
 }
+
+/// Regression (bead postbackup-hook-aborts-all-1vt): a failing
+/// post-backup hook for one agent must not abort the backup of the
+/// remaining agents or skip cleanup — it is recorded on that agent's
+/// outcome like any other per-agent failure.
+#[test]
+#[cfg(unix)] // requires bash hook script
+fn post_backup_hook_failure_does_not_abort_other_agents() {
+    let home = TempDir::new().unwrap();
+    let src_a = TempDir::new().unwrap();
+    let src_b = TempDir::new().unwrap();
+    fs::write(src_a.path().join("a.txt"), "a").unwrap();
+    fs::write(src_b.path().join("b.txt"), "b").unwrap();
+    let backup_root = home.path().join(".agent_settings_backups");
+    fs::create_dir_all(&backup_root).unwrap();
+    let cfg_dir = home.path().join(".config").join("casb");
+    fs::create_dir_all(&cfg_dir).unwrap();
+    let config_path = cfg_dir.join("config.toml");
+    let cfg = format!(
+        r#"[general]
+backup_root = "{}"
+auto_commit = true
+
+[backup]
+use_rsync = false
+
+[agents.pa]
+enabled = true
+locations = ["{}"]
+exclusions = []
+
+[agents.pb]
+enabled = true
+locations = ["{}"]
+exclusions = []
+"#,
+        backup_root.display().to_string().replace('\\', "/"),
+        src_a.path().display().to_string().replace('\\', "/"),
+        src_b.path().display().to_string().replace('\\', "/"),
+    );
+    fs::write(&config_path, cfg).unwrap();
+
+    // Fails only for agent pa (first positional arg is the agent key).
+    let hook_dir = cfg_dir.join("post-backup.d");
+    fs::create_dir_all(&hook_dir).unwrap();
+    let hook_path = hook_dir.join("00-fail-pa.sh");
+    fs::write(
+        &hook_path,
+        "#!/usr/bin/env bash\n[ \"$1\" = \"pa\" ] && exit 1\nexit 0\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_path, perms).unwrap();
+    }
+
+    let mut cmd = Command::cargo_bin("casb").unwrap();
+    cmd.env("HOME", home.path())
+        .env("CASB_CONFIG", &config_path)
+        .args(["backup", "pa", "pb"]);
+    let assert = cmd.assert().failure();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("post-backup hook failed"),
+        "pa outcome must record the hook failure: {stdout}"
+    );
+
+    // pb must still have been backed up and committed (Phase 2+3 ran).
+    let out = std::process::Command::new("git")
+        .current_dir(&backup_root)
+        .args(["ls-files", ".pb"])
+        .output()
+        .unwrap();
+    let tracked = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        tracked.contains(".pb/b.txt"),
+        "pb files must be committed despite pa's hook failure: {tracked}"
+    );
+}
