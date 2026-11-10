@@ -304,9 +304,9 @@ fn sync_rsync(
             args.push(format!("--max-size={cap}"));
         }
     }
-    for pat in filter.raw_patterns() {
+    for pat in rsync_exclude_patterns(filter.raw_patterns()) {
         args.push("--exclude".to_string());
-        args.push(pat.clone());
+        args.push(pat);
     }
     let src_arg = format!("{}/", src.display());
     let dest_arg = format!("{}/", dest.display());
@@ -341,6 +341,36 @@ fn sync_rsync(
         used_rsync: true,
         ..Default::default()
     })
+}
+
+/// Expand filter patterns into rsync `--exclude` arguments.
+///
+/// rsync anchors any pattern containing `/` to the transfer root, and a
+/// `**/` component does *not* match the root level itself — so the glob
+/// pattern `**/history.jsonl` excludes `a/b/history.jsonl` but NOT a
+/// root-level `history.jsonl`. On the restore path (`--delete`) that
+/// unprotected root file would be deleted even though the backup
+/// deliberately never contained it.
+///
+/// For every pattern containing `**/`, emit an additional collapsed variant
+/// with the `**/` components removed (`**/history.jsonl` → `history.jsonl`,
+/// `x/**/y` → `x/y`). The collapsed form has no leading `**/` anchor problem:
+/// a pattern without `/` matches the basename at every level (a superset of
+/// the intended set), and a pattern with `/` is correctly root-anchored.
+fn rsync_exclude_patterns(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len() * 2);
+    for pat in raw {
+        if !out.iter().any(|p| p == pat) {
+            out.push(pat.clone());
+        }
+        if pat.contains("**/") {
+            let collapsed = pat.replace("**/", "");
+            if !collapsed.is_empty() && !out.iter().any(|p| p == &collapsed) {
+                out.push(collapsed);
+            }
+        }
+    }
+    out
 }
 
 fn sync_walkdir(
@@ -698,5 +728,64 @@ mod tests {
         assert_eq!(head_contents, "ref: refs/heads/main");
         // Real files still get through.
         assert!(dest.path().join("real.txt").exists());
+    }
+
+    /// Regression (bead restore-deletes-excluded-files-js4): rsync anchors
+    /// patterns containing `/` to the transfer root and `**/` does not match
+    /// the root level, so `**/history.jsonl` left a root-level file
+    /// unprotected from `--delete`. The collapsed variant must be emitted.
+    #[test]
+    fn rsync_patterns_cover_root_level() {
+        let raw = vec![
+            "**/history.jsonl".to_string(),
+            "**/cache/**".to_string(),
+            "**/cache".to_string(),
+            "cache/".to_string(),
+            "*.log".to_string(),
+        ];
+        let pats = rsync_exclude_patterns(&raw);
+        assert!(pats.contains(&"**/history.jsonl".to_string()));
+        assert!(pats.contains(&"history.jsonl".to_string()));
+        assert!(pats.contains(&"cache/**".to_string()));
+        assert!(pats.contains(&"cache".to_string()));
+        assert!(pats.contains(&"*.log".to_string()));
+        // No duplicates.
+        let mut dedup = pats.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(dedup.len(), pats.len());
+    }
+
+    /// End-to-end rsync check (skipped silently when rsync is absent): a
+    /// root-level excluded file must survive a `--delete` sync back into
+    /// the source.
+    #[test]
+    fn rsync_restore_preserves_root_level_excluded_file() {
+        if !crate::util::which("rsync") {
+            return;
+        }
+        let backup = tempdir().unwrap(); // stands in for the backup tree
+        let live = tempdir().unwrap(); // stands in for the agent source
+        std::fs::write(backup.path().join("settings.json"), "{}").unwrap();
+        std::fs::write(live.path().join("settings.json"), "{}").unwrap();
+        // Excluded at backup time, so absent from `backup` — but present
+        // and precious in `live`.
+        std::fs::write(live.path().join("history.jsonl"), "LIVE-DATA").unwrap();
+        let filter = ExclusionFilter::new(vec!["**/history.jsonl".into()]).unwrap();
+        sync_location_raw(
+            backup.path(),
+            live.path(),
+            &filter,
+            true,
+            false,
+            LocationKind::Directory,
+            SyncDirection::ToSource,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(live.path().join("history.jsonl")).unwrap(),
+            "LIVE-DATA",
+            "root-level excluded file must survive rsync --delete"
+        );
     }
 }
