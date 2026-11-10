@@ -325,9 +325,15 @@ pub fn backup_agents(
         let pruned_nested = crate::sync::prune_stale_location_subdirs(&installed, &backup_root)?;
         let pruned: Vec<String> = pruned.into_iter().chain(pruned_nested).collect();
         if cfg.general.auto_commit {
-            // The repo-root .gitignore is rewritten every run — keep it
-            // tracked or the worktree is permanently dirty with `??`.
-            let _ = repo.add_paths(&[".gitignore".to_string()]);
+            // The repo-root .gitignore is rewritten every run and README.md
+            // is written once at init — keep both tracked or the worktree
+            // is permanently dirty with `??`.
+            let housekeeping: Vec<String> = [".gitignore", "README.md"]
+                .iter()
+                .map(|s| s.to_string())
+                .filter(|p| backup_root.join(p).exists())
+                .collect();
+            let _ = repo.add_paths(&housekeeping);
             // Stage and commit the pruned directories' deletions. Without
             // this the removals sit in the worktree forever as unstaged
             // changes — and the next agent's scoped `git add` would never
