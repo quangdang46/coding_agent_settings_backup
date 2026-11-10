@@ -798,7 +798,16 @@ fn cmd_config(
                 )?;
                 return Ok(());
             }
-            cfg.save_to(&path)?;
+            if !path.exists() {
+                // Seed a complete default document first so `set` on a fresh
+                // file produces a usable config, not a lone key. Defaults —
+                // not the env-merged `cfg` — so env vars never leak in.
+                Config::default().save_to(&path)?;
+            }
+            // Patch only the requested key. Serialising the whole effective
+            // config here would bake env-resolved values (e.g.
+            // CASB_BACKUP_ROOT) into the user's real config file.
+            Config::set_key_in_file(&path, &key, &value)?;
             p.text_line(&format!("set {key} = {value}"))?;
             emit_data(
                 p,
@@ -816,7 +825,10 @@ fn cmd_config(
             } else if path.exists() {
                 p.text_line(&format!("config exists at {}", path.display()))?;
             } else {
-                cfg.save_to(&path)?;
+                // Write built-in defaults, not the env-merged `cfg`, so
+                // environment overrides (e.g. CASB_BACKUP_ROOT) are not
+                // persisted into the file.
+                Config::default().save_to(&path)?;
                 p.text_line(&format!("wrote default config to {}", path.display()))?;
             }
             emit_data(

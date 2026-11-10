@@ -304,6 +304,84 @@ impl Config {
         Ok(())
     }
 
+    /// Set a single dotted key directly in the TOML file at `path`,
+    /// preserving every other byte of the document — unrelated keys,
+    /// comments, ordering, formatting.
+    ///
+    /// Unlike [`Config::save_to`], which serialises the whole *effective*
+    /// config, this patches only the requested key. That matters because the
+    /// effective config contains environment-resolved values (e.g.
+    /// `CASB_BACKUP_ROOT`): re-serialising it would bake those ephemeral
+    /// values into the user's real config file.
+    ///
+    /// The key must already be valid for [`Config::set_dotted`]; the value
+    /// literal is typed to match (bool keys get TOML booleans, the size cap
+    /// gets an integer, everything else a quoted string).
+    pub fn set_key_in_file(path: &Path, key: &str, value: &str) -> Result<()> {
+        let literal = toml_literal_for(key, value)?;
+        let (section, leaf) = key.split_once('.').ok_or_else(|| {
+            CasbError::InvalidArgument(format!("config key must be dotted: {key}"))
+        })?;
+
+        let text = if path.exists() {
+            std::fs::read_to_string(path)?
+        } else {
+            String::new()
+        };
+
+        let mut out: Vec<String> = Vec::new();
+        let mut in_section = false;
+        let mut section_seen = false;
+        let mut key_written = false;
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            // Section header (single-bracket tables only — casb configs
+            // never use [[array-of-tables]]). Whitespace inside brackets is
+            // tolerated.
+            if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.starts_with("[[") {
+                let name = trimmed[1..trimmed.len() - 1].trim();
+                if in_section && !key_written {
+                    // Left the target section without finding the key:
+                    // append it at the end of that section.
+                    out.push(format!("{leaf} = {literal}"));
+                    key_written = true;
+                }
+                in_section = name == section;
+                section_seen |= in_section;
+                out.push(line.to_string());
+                continue;
+            }
+            if in_section && !key_written && is_toml_key_line(line, leaf) {
+                out.push(format!("{leaf} = {literal}"));
+                key_written = true;
+                continue;
+            }
+            out.push(line.to_string());
+        }
+        if !section_seen {
+            if out.last().is_some_and(|l| !l.trim().is_empty()) {
+                out.push(String::new());
+            }
+            out.push(format!("[{section}]"));
+            out.push(format!("{leaf} = {literal}"));
+        } else if !key_written && in_section {
+            // Target section was the last section and the key was absent:
+            // append at the end of the file (still inside that section).
+            out.push(format!("{leaf} = {literal}"));
+        }
+
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let mut body = out.join("\n");
+        body.push('\n');
+        std::fs::write(path, body)?;
+        Ok(())
+    }
+
     /// Get a single dotted-key string value (for `casb config get`).
     pub fn get_dotted(&self, key: &str) -> Option<String> {
         match key {
@@ -379,6 +457,70 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
+/// Render `value` as a TOML literal appropriate for `key`.
+///
+/// Mirrors the type coercion in [`Config::set_dotted`]: boolean keys emit
+/// TOML booleans, `backup.max_file_size_mb` emits an integer, and every
+/// other key emits a quoted basic string.
+fn toml_literal_for(key: &str, value: &str) -> Result<String> {
+    const BOOL_KEYS: &[&str] = &[
+        "general.auto_commit",
+        "general.verbose",
+        "general.quiet",
+        "backup.use_rsync",
+        "backup.checksum_verify",
+    ];
+    if BOOL_KEYS.contains(&key) {
+        return parse_bool(value).map(|b| b.to_string()).ok_or_else(|| {
+            CasbError::InvalidArgument(format!("expected bool, got '{value}'"))
+        });
+    }
+    if key == "backup.max_file_size_mb" {
+        return value
+            .trim()
+            .parse::<u64>()
+            .map(|n| n.to_string())
+            .map_err(|_| {
+                CasbError::InvalidArgument(format!(
+                    "expected a non-negative integer, got '{value}'"
+                ))
+            });
+    }
+    Ok(toml_string_literal(value))
+}
+
+/// Quote `s` as a TOML basic string with the required escapes.
+fn toml_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Whether `line` assigns to the bare (or quoted) TOML key `leaf`.
+fn is_toml_key_line(line: &str, leaf: &str) -> bool {
+    let t = line.trim_start();
+    for prefix in [leaf.to_string(), format!("\"{leaf}\"")] {
+        if let Some(rest) = t.strip_prefix(&prefix) {
+            if rest.trim_start().starts_with('=') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +578,74 @@ backup_root = "/tmp/casb-test"
         cfg.save_to(&path).unwrap();
         let back = Config::load_from(Some(&path)).unwrap();
         assert_eq!(back.general.backup_root, "/tmp/x");
+    }
+
+    #[test]
+    fn set_key_in_file_patches_only_that_key() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        let original = r#"# user comment stays
+[general]
+backup_root = "/original"
+auto_commit = true  # trailing comment
+verbose = false
+
+[backup]
+use_rsync = true
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        Config::set_key_in_file(&path, "general.verbose", "true").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# user comment stays"));
+        assert!(text.contains("backup_root = \"/original\""));
+        assert!(text.contains("verbose = true"));
+        assert!(text.contains("auto_commit = true  # trailing comment"));
+        // Round-trips through the real parser.
+        let cfg = Config::load_from(Some(&path)).unwrap();
+        assert!(cfg.general.verbose);
+        assert_eq!(cfg.general.backup_root, "/original");
+    }
+
+    #[test]
+    fn set_key_in_file_adds_missing_key_and_section() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, "[general]\nbackup_root = \"/x\"\n").unwrap();
+
+        // Missing key inside an existing section → appended in-section.
+        Config::set_key_in_file(&path, "general.quiet", "true").unwrap();
+        // Missing section entirely → appended at end.
+        Config::set_key_in_file(&path, "schedule.method", "cron").unwrap();
+        // Typed literals: bool and integer are not quoted.
+        Config::set_key_in_file(&path, "backup.max_file_size_mb", "42").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let cfg = Config::load_from(Some(&path)).unwrap();
+        assert!(cfg.general.quiet);
+        assert_eq!(cfg.schedule.method, "cron");
+        assert_eq!(cfg.backup.max_file_size_mb, 42);
+        assert!(text.contains("quiet = true"), "got:\n{text}");
+        assert!(text.contains("max_file_size_mb = 42"), "got:\n{text}");
+        assert!(text.contains("[schedule]"), "got:\n{text}");
+    }
+
+    #[test]
+    fn set_key_in_file_creates_missing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested/c.toml");
+        Config::set_key_in_file(&path, "general.backup_root", "/tmp/b").unwrap();
+        let cfg = Config::load_from(Some(&path)).unwrap();
+        assert_eq!(cfg.general.backup_root, "/tmp/b");
+    }
+
+    #[test]
+    fn set_key_in_file_rejects_bad_typed_values() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, "").unwrap();
+        assert!(Config::set_key_in_file(&path, "general.verbose", "maybe").is_err());
+        assert!(Config::set_key_in_file(&path, "backup.max_file_size_mb", "-1").is_err());
+        assert!(Config::set_key_in_file(&path, "nodot", "x").is_err());
     }
 }
