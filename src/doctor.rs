@@ -90,12 +90,30 @@ pub fn run(cfg: &Config, registry: &Registry) -> Result<DoctorReport> {
         }
     }
 
-    // Hooks dirs exist (informational only — pass if dir absent).
+    // Hooks dirs exist (informational only — pass if dir absent). An empty
+    // directory is reported as such rather than "found", so the detail
+    // reflects whether any hook scripts are actually configured.
     for kind in all_kinds() {
         let dir = hooks_dir(kind)?;
+        let hook_count = if dir.is_dir() {
+            std::fs::read_dir(&dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().is_file())
+                        .count()
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let ok = !dir.exists() || dir.is_dir();
         let detail = if dir.exists() {
-            Some(format!("found at {}", dir.display()))
+            Some(if hook_count > 0 {
+                format!("found at {} ({hook_count} hook(s))", dir.display())
+            } else {
+                format!("found at {} (empty — no hooks)", dir.display())
+            })
         } else {
             None
         };

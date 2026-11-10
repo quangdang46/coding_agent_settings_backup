@@ -518,6 +518,300 @@ fn portable_lifecycle_backup_and_restore() {
     assert_eq!(json["ok"], serde_json::Value::Bool(true));
 }
 
+// ---- Regression tests for review findings ----
+
+/// `casb init` must leave a usable git repository, not just a directory
+/// with a README.
+#[test]
+fn init_creates_git_repo() {
+    let dummy = TempDir::new().unwrap();
+    let env = Env::new("initgit", dummy.path());
+    env.casb().arg("init").assert().success();
+    assert!(
+        env.backup_root.join(".git").exists(),
+        "init must create the shared .git repository"
+    );
+}
+
+/// `--dry-run init` reports the plan without creating anything.
+#[test]
+fn init_dry_run_creates_nothing() {
+    let dummy = TempDir::new().unwrap();
+    let env = Env::new("initdry", dummy.path());
+    env.casb()
+        .args(["--dry-run", "init"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("dry-run"));
+    assert!(!env.backup_root.join(".git").exists());
+}
+
+/// Declining the restore prompt is a normal choice: exit 0, source untouched.
+#[test]
+fn restore_declined_prompt_exits_zero() {
+    let mock = generate_mock_portable("codex");
+    let agent_src = mock.path().join(".codex");
+    let env = Env::new("codex_dec", &agent_src);
+    env.casb().arg("init").assert().success();
+    env.casb().args(["backup", "codex_dec"]).assert().success();
+    fs::write(agent_src.join("config.toml"), "changed-by-user\n").unwrap();
+
+    env.casb()
+        .args(["restore", "codex_dec"])
+        .write_stdin("n\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("cancelled"));
+    assert_eq!(
+        fs::read_to_string(agent_src.join("config.toml")).unwrap(),
+        "changed-by-user\n",
+        "declined restore must not modify the source"
+    );
+}
+
+/// In --json mode there is no interactive user: restore without --force
+/// must fail with a structured error and never print the prompt to stdout.
+#[test]
+fn json_restore_without_force_fails_cleanly() {
+    let mock = generate_mock_portable("codex");
+    let agent_src = mock.path().join(".codex");
+    let env = Env::new("codex_jr", &agent_src);
+    env.casb().arg("init").assert().success();
+    env.casb().args(["backup", "codex_jr"]).assert().success();
+    fs::write(agent_src.join("config.toml"), "changed\n").unwrap();
+
+    let assert = env
+        .casb()
+        .args(["--json", "restore", "codex_jr"])
+        .assert()
+        .failure();
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("[y/N]"),
+        "prompt must never reach stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("--force"),
+        "expected a confirmation-required error on stderr: {stderr}"
+    );
+}
+
+/// `schedule install --dry-run` prints the plan and exits fast without
+/// touching crontab/systemd.
+#[test]
+fn schedule_install_dry_run_does_not_install() {
+    let dummy = TempDir::new().unwrap();
+    let env = Env::new("scheddry", dummy.path());
+    env.casb()
+        .args(["--dry-run", "schedule", "install", "--method", "cron"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("dry-run"));
+    env.casb()
+        .args(["--dry-run", "schedule", "remove"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("dry-run"));
+    env.casb()
+        .args(["schedule", "status"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("no schedule installed"));
+}
+
+/// `config set` must patch only the requested key: unrelated keys and
+/// comments survive, and env-resolved values (CASB_BACKUP_ROOT) are not
+/// baked into the file.
+#[test]
+fn config_set_preserves_file_contents_and_env() {
+    let dummy = TempDir::new().unwrap();
+    let env = Env::new("cfgset", dummy.path());
+    let before = fs::read_to_string(&env.config_path).unwrap();
+    let backup_root_line = before
+        .lines()
+        .find(|l| l.trim_start().starts_with("backup_root"))
+        .unwrap()
+        .to_string();
+    fs::write(
+        &env.config_path,
+        format!("# user-authored comment\n{before}"),
+    )
+    .unwrap();
+
+    env.casb()
+        .env("CASB_BACKUP_ROOT", "/tmp/env-leak-root-xyz")
+        .args(["config", "set", "general.verbose", "true"])
+        .assert()
+        .success();
+
+    let after = fs::read_to_string(&env.config_path).unwrap();
+    assert!(after.contains("# user-authored comment"), "got:\n{after}");
+    assert!(
+        after.contains(&backup_root_line),
+        "backup_root line must be preserved verbatim, got:\n{after}"
+    );
+    assert!(
+        !after.contains("env-leak-root-xyz"),
+        "env-resolved value must not be persisted, got:\n{after}"
+    );
+    assert!(after.contains("verbose = true"), "got:\n{after}");
+}
+
+/// `backup --dry-run` on a fresh repo (no .git yet) must report the real
+/// number of files that would be copied, not ~zero.
+#[test]
+fn dry_run_backup_on_fresh_repo_reports_files() {
+    let mock = generate_mock_portable("codex");
+    let agent_src = mock.path().join(".codex");
+    let env = Env::new("codex_dry2", &agent_src);
+    // Deliberately no `init`: the backup root has no .git yet.
+    env.casb()
+        .args(["--dry-run", "backup", "codex_dry2"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("files").and(predicates::str::contains("0 files").not()));
+    assert!(
+        !env.backup_root.join(".git").exists(),
+        "dry-run must not create the repo"
+    );
+}
+
+/// `import --dry-run` validates the archive without writing to the backup
+/// root.
+#[test]
+fn import_dry_run_validates_without_writing() {
+    let mock = generate_mock_portable("kiro");
+    let env = Env::new("kiro_id", &mock.path().join(".kiro"));
+    env.casb().arg("init").assert().success();
+    env.casb().args(["backup", "kiro_id"]).assert().success();
+    let archive_dir = TempDir::new().unwrap();
+    let archive = archive_dir.path().join("kiro.tar.gz");
+    env.casb()
+        .args(["export", "kiro_id"])
+        .arg(&archive)
+        .assert()
+        .success();
+
+    let mock2 = generate_mock_portable("kiro");
+    let env2 = Env::new("kiro_id", &mock2.path().join(".kiro"));
+    env2.casb()
+        .args(["--dry-run", "import"])
+        .arg(&archive)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("dry-run"));
+    assert!(
+        !env2.backup_root.join(".git").exists(),
+        "dry-run import must not write anything"
+    );
+}
+
+/// An existing-but-empty hooks directory must be reported as empty, not
+/// as "found" hooks.
+#[test]
+fn doctor_reports_empty_hooks_dir() {
+    let dummy = TempDir::new().unwrap();
+    let env = Env::new("doce", dummy.path());
+    let hooks_dir = env
+        .home
+        .path()
+        .join(".config")
+        .join("casb")
+        .join("pre-backup.d");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    env.casb()
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("empty"));
+}
+
+/// `stats <agent>` totals must be scoped to that agent, not the whole
+/// shared repository. Two agents are backed up so the repo holds commits
+/// the filtered agent did not make.
+#[test]
+fn stats_filtered_totals_are_scoped() {
+    let mock_a = generate_mock_portable("codex");
+    let src_a = mock_a.path().join(".codex");
+    let mock_b = generate_mock_portable("kiro");
+    let src_b = mock_b.path().join(".kiro");
+    let env = Env::new("statsa", &src_a);
+    // Register a second custom agent in the same config file.
+    let src_b_str = src_b.display().to_string().replace('\\', "/");
+    let mut cfg_text = fs::read_to_string(&env.config_path).unwrap();
+    cfg_text.push_str(&format!(
+        "\n[agents.statsb]\nenabled = true\ndisplay_name = \"Mock statsb\"\nlocations = [\"{src_b_str}\"]\nexclusions = []\n"
+    ));
+    fs::write(&env.config_path, cfg_text).unwrap();
+
+    env.casb().arg("init").assert().success();
+    env.casb().args(["backup", "statsa"]).assert().success();
+    env.casb().args(["backup", "statsb"]).assert().success();
+
+    let assert = env
+        .casb()
+        .args(["--json", "stats", "statsa"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let agent_commits = json["data"]["agents"][0]["commits"].as_u64().unwrap();
+    let total_commits = json["data"]["total_commits"].as_u64().unwrap();
+    assert_eq!(
+        agent_commits, 1,
+        "statsa should have exactly its own commit, got {json}"
+    );
+    assert_eq!(
+        agent_commits, total_commits,
+        "filtered stats total must be scoped to the agent, not the shared repo"
+    );
+}
+
+/// `--json backup` with a failing agent must emit ok:false plus an errors
+/// list, matching the non-zero exit.
+#[test]
+#[cfg(unix)] // requires bash hook script
+fn json_backup_reports_ok_false_on_failure() {
+    let src = TempDir::new().unwrap();
+    fs::write(src.path().join("a.txt"), "x").unwrap();
+    let env = Env::new("failjson", src.path());
+
+    let hook_dir = env
+        .home
+        .path()
+        .join(".config")
+        .join("casb")
+        .join("pre-backup.d");
+    fs::create_dir_all(&hook_dir).unwrap();
+    let hook_path = hook_dir.join("00-fail.sh");
+    fs::write(&hook_path, "#!/usr/bin/env bash\nexit 1\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_path, perms).unwrap();
+    }
+
+    env.casb().arg("init").assert().success();
+    let assert = env
+        .casb()
+        .args(["--json", "backup", "failjson"])
+        .assert()
+        .failure();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(json["ok"], serde_json::Value::Bool(false));
+    assert!(
+        json["errors"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "expected non-empty errors array: {json}"
+    );
+}
+
 #[test]
 fn portable_export_import_round_trip() {
     let mock = generate_mock_portable("kiro");

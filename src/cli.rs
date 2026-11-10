@@ -118,6 +118,9 @@ pub enum Command {
         agent: String,
 
         /// Maximum number of commits to show.
+        ///
+        /// `-l`/`--limit` is the flag to use: `-n` is reserved globally for
+        /// `--dry-run`, so `casb history <agent> -n 5` cannot mean "last 5".
         #[arg(short = 'l', long, default_value_t = 20)]
         limit: usize,
     },

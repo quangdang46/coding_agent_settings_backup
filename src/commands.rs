@@ -66,9 +66,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Export { agent, file } => {
             cmd_export(&cfg, &registry, &mut printer, &agent, file.as_deref())
         }
-        Command::Import { file } => {
-            cmd_import(&cfg, &mut printer, file.as_deref(), cli.dry_run)
-        }
+        Command::Import { file } => cmd_import(&cfg, &mut printer, file.as_deref(), cli.dry_run),
         Command::List => cmd_list(&cfg, &registry, &mut printer),
         Command::History { agent, limit } => {
             cmd_history(&cfg, &registry, &mut printer, &agent, limit)
@@ -164,6 +162,12 @@ fn cmd_init(
         return Ok(());
     }
     let root = backup::init_backup_root(cfg, root)?;
+    // `init` should leave a usable repository behind, not just a directory
+    // with a README — create the shared .git if it does not exist yet.
+    let repo = crate::git::Repo::new(&root);
+    if !repo.exists() {
+        repo.init()?;
+    }
     p.text_line(&format!("initialised backup root at {}", root.display()))?;
     emit_data(
         p,
@@ -219,7 +223,17 @@ fn cmd_restore(
 ) -> Result<()> {
     let agent = registry.get(key)?;
     require_confirmation_mode(p, force, dry_run, "restore")?;
-    let (preview, outcome) = restore::restore_agent(cfg, agent, reference, force, dry_run)?;
+    let (preview, outcome) = match restore::restore_agent(cfg, agent, reference, force, dry_run) {
+        Ok(v) => v,
+        // Declining the prompt is a normal user choice, not an error:
+        // exit 0 so scripts wrapping `casb restore` don't treat "no" as
+        // a failure.
+        Err(CasbError::Cancelled) => {
+            p.text_line("restore cancelled")?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     print_preview(p, &preview)?;
     if outcome.applied {
         p.text_line(&format!(
@@ -564,7 +578,15 @@ fn cmd_tag(
         TagAction::Restore { agent, name } => {
             let a = registry.get(&agent)?;
             require_confirmation_mode(p, force, dry_run, "tag restore")?;
-            let (preview, outcome) = restore::restore_agent(cfg, a, Some(&name), force, dry_run)?;
+            let (preview, outcome) =
+                match restore::restore_agent(cfg, a, Some(&name), force, dry_run) {
+                    Ok(v) => v,
+                    Err(CasbError::Cancelled) => {
+                        p.text_line("restore cancelled")?;
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                };
             print_preview(p, &preview)?;
             if outcome.applied {
                 p.text_line(&format!(
@@ -584,7 +606,14 @@ fn cmd_tag(
 // ----- stats -----
 
 fn cmd_stats(cfg: &Config, registry: &Registry, p: &mut Printer, key: Option<&str>) -> Result<()> {
-    let s = stats::compute_stats(cfg, registry, key)?;
+    let mut s = stats::compute_stats(cfg, registry, key)?;
+    if key.is_some() {
+        // A filtered view must not print repo-global totals: scope them to
+        // the selected agent(s) so `stats <agent>` doesn't claim the whole
+        // shared repository's commit count and byte size.
+        s.total_repo_bytes = s.agents.iter().map(|a| a.repo_bytes).sum();
+        s.total_commits = s.agents.iter().map(|a| a.commits).sum();
+    }
     for entry in &s.agents {
         if !entry.repo_exists && !entry.installed {
             continue;
@@ -673,7 +702,11 @@ fn cmd_schedule(p: &mut Printer, action: ScheduleAction, dry_run: bool) -> Resul
                 let s = schedule::status()?;
                 p.text_line(&format!(
                     "dry-run: would remove schedule (currently {})",
-                    if s.installed { "installed" } else { "not installed" }
+                    if s.installed {
+                        "installed"
+                    } else {
+                        "not installed"
+                    }
                 ))?;
                 emit_data(
                     p,
@@ -819,7 +852,11 @@ fn cmd_config(
             if dry_run {
                 p.text_line(&format!(
                     "dry-run: would {} config at {}",
-                    if path.exists() { "keep existing" } else { "write default" },
+                    if path.exists() {
+                        "keep existing"
+                    } else {
+                        "write default"
+                    },
                     path.display()
                 ))?;
             } else if path.exists() {
