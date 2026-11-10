@@ -277,13 +277,21 @@ pub enum ConfigAction {
 }
 
 impl Cli {
-    /// Resolve the effective output format from `--json` and `--format` flags.
-    pub fn effective_format(&self) -> OutputFormat {
+    /// Resolve the effective output format. Precedence: `--format`,
+    /// `--json`, then `general.output_format` from config, then text.
+    pub fn effective_format(&self, cfg: Option<&crate::config::Config>) -> OutputFormat {
         if let Some(fmt) = self.format {
             return fmt;
         }
         if self.json {
             return OutputFormat::Json;
+        }
+        if let Some(cfg) = cfg {
+            match cfg.general.output_format.as_str() {
+                "json" => return OutputFormat::Json,
+                "toon" => return OutputFormat::Toon,
+                _ => {}
+            }
         }
         OutputFormat::Text
     }

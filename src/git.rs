@@ -354,11 +354,6 @@ impl Repo {
         Ok(s.parse().unwrap_or(0))
     }
 
-    /// Run `git log` and return parsed entries, newest first.
-    pub fn log(&self, limit: usize) -> Result<Vec<LogEntry>> {
-        self.log_for_paths(limit, &[])
-    }
-
     /// Run `git log` restricted to the given paths.
     ///
     /// All agents share one repository, so an unscoped `git log` returns every
@@ -537,13 +532,6 @@ impl Repo {
         Ok(entries)
     }
 
-    /// Restore working tree to the contents of `refname` using a hard
-    /// checkout. Equivalent to `git checkout <ref> -- .`.
-    pub fn checkout_ref_into_worktree(&self, refname: &str) -> Result<()> {
-        run_git_in(&self.path, &["checkout", refname, "--", "."])?;
-        Ok(())
-    }
-
     /// Remove all files tracked by `.gitignore` from the working tree but
     /// keep them in git history. Prevents rsync-copied, gitignore-excluded
     /// binaries (packages/, plugins/, computer-use/, etc.) from wasting
@@ -705,7 +693,7 @@ mod tests {
         repo.add_all().unwrap();
         repo.commit("first").unwrap();
         repo.tag_create("v1", None).unwrap();
-        let log = repo.log(10).unwrap();
+        let log = repo.log_for_paths(10, &[]).unwrap();
         assert_eq!(log.len(), 1);
         assert!(log[0].tags.contains(&"v1".to_string()));
         assert_eq!(log[0].subject, "first");

@@ -97,6 +97,7 @@ pub fn backup_agents(
         write_default_gitignore(
             &backup_root,
             &cfg.backup.exclusions,
+            &agents,
             cfg.backup.include_secrets,
         )?;
     }
@@ -309,12 +310,20 @@ pub fn backup_agents(
         // data under `.claude/home`, `.claude/data` and `.claude/root`, and
         // matching the full subdirectory path would make `.claude` look
         // stale and delete the agent's whole backup.
-        let known_subdirs: HashSet<String> = registry
-            .installed()
+        let installed: Vec<&AgentConfig> = registry.installed().collect();
+        let known_subdirs: HashSet<String> = installed
+            .iter()
             .flat_map(|a| a.installed_locations())
             .map(|l| top_level_subdir(&l.backup_subdir))
             .collect();
         let pruned = crate::sync::prune_stale_subdirs(&known_subdirs, &backup_root)?;
+        // Nested per-location dirs (`.claude/home`, `.multi/loc0`) can go
+        // stale independently of the top level — e.g. a custom override of
+        // a built-in agent switching from the builtin layout to `locN`
+        // names. Prune them too so old tracked duplicates aren't restored
+        // forever.
+        let pruned_nested = crate::sync::prune_stale_location_subdirs(&installed, &backup_root)?;
+        let pruned: Vec<String> = pruned.into_iter().chain(pruned_nested).collect();
         if cfg.general.auto_commit {
             // The repo-root .gitignore is rewritten every run — keep it
             // tracked or the worktree is permanently dirty with `??`.
@@ -395,12 +404,12 @@ pub fn build_agent_filter(
         .get(&agent.key)
         .map(|a| a.exclusions.clone())
         .unwrap_or_default();
-    let mut filter = ExclusionFilter::from_layers(
-        &crate::config::default_exclusions(),
-        &cfg.backup.exclusions,
-        &agent_extras,
-    )?
-    .with_max_file_size(max_file_size_bytes(cfg));
+    // Agent-keyed patterns (e.g. OpenCode's `package.json`) apply only to
+    // that agent — they must not leak into every other agent's filter.
+    let mut base = crate::config::default_exclusions();
+    base.extend(crate::config::agent_exclusions(&agent.key));
+    let mut filter = ExclusionFilter::from_layers(&base, &cfg.backup.exclusions, &agent_extras)?
+        .with_max_file_size(max_file_size_bytes(cfg));
     // Credential-shaped files are excluded by default: the backup repo is
     // plaintext git, so committing `auth.json`/`*.pem`/`.env*` would leak
     // live secrets into history permanently. `backup.include_secrets=true`
@@ -567,7 +576,12 @@ fn write_root_readme(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_default_gitignore(repo: &Path, extras: &[String], include_secrets: bool) -> Result<()> {
+fn write_default_gitignore(
+    repo: &Path,
+    extras: &[String],
+    agents: &[&AgentConfig],
+    include_secrets: bool,
+) -> Result<()> {
     let path = repo.join(".gitignore");
     let mut existing = String::new();
     if path.exists() {
@@ -587,6 +601,33 @@ fn write_default_gitignore(repo: &Path, extras: &[String], include_secrets: bool
     for pat in defaults.iter().chain(extras.iter()).chain(secrets.iter()) {
         if !lines.iter().any(|l| l.trim() == pat.trim()) {
             lines.push(pat.clone());
+        }
+    }
+    // Agent-scoped patterns must be prefixed with each location's
+    // backup_subdir — written unprefixed they would ignore e.g.
+    // `package.json` under EVERY agent's tree even though only OpenCode's
+    // filter excludes it.
+    for agent in agents {
+        let pats = crate::config::agent_exclusions(&agent.key);
+        if pats.is_empty() {
+            continue;
+        }
+        let subs: std::collections::BTreeSet<&str> = agent
+            .locations
+            .iter()
+            .map(|l| l.backup_subdir.trim_end_matches('/'))
+            .filter(|s| !s.is_empty())
+            .collect();
+        // A File-kind location's backup_subdir is a directory that holds
+        // the file; patterns still apply beneath it.
+        for sub in subs {
+            for pat in &pats {
+                let stripped = pat.strip_prefix("**/").unwrap_or(pat);
+                let scoped = format!("{sub}/**/{stripped}");
+                if !lines.iter().any(|l| l.trim() == scoped) {
+                    lines.push(scoped);
+                }
+            }
         }
     }
     let body = lines.join("\n") + "\n";
@@ -1124,5 +1165,117 @@ mod tests {
             "worktree must be clean after prune commit: {}",
             String::from_utf8_lossy(&status.stdout)
         );
+    }
+
+    /// Regression (cleanup batch): agent-scoped exclusions must not leak
+    /// onto other agents. `package.json` is excluded for OpenCode only —
+    /// a custom agent's `package.json` is legitimate config and must be
+    /// backed up.
+    #[test]
+    fn agent_scoped_exclusions_do_not_leak() {
+        let backup_root = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::write(src.path().join("package.json"), "{}").unwrap();
+        std::fs::write(src.path().join("settings.json"), "{}").unwrap();
+        let cfg = cfg_for(backup_root.path());
+        let agent = make_agent("pkg", src.path());
+        let reg = registry_with(&agent);
+        backup_agents(&cfg, &reg, &["pkg".into()], None, false, false).unwrap();
+        assert!(
+            backup_root.path().join(".pkg/package.json").exists(),
+            "package.json must be backed up for non-opencode agents"
+        );
+        // And the .gitignore must scope opencode's patterns under .opencode,
+        // not apply them repo-wide.
+        let oc_backup = tempdir().unwrap();
+        let oc_src = tempdir().unwrap();
+        std::fs::write(oc_src.path().join("package.json"), "{}").unwrap();
+        let mut cfg2 = cfg_for(oc_backup.path());
+        cfg2.agents.insert(
+            "opencode".into(),
+            crate::config::CustomAgentConfig {
+                enabled: true,
+                display_name: None,
+                locations: vec![oc_src.path().display().to_string()],
+                exclusions: vec![],
+            },
+        );
+        let reg2 = Registry::from_config(&cfg2).unwrap();
+        backup_agents(&cfg2, &reg2, &["opencode".into()], None, false, false).unwrap();
+        assert!(
+            !oc_backup.path().join(".opencode/package.json").exists(),
+            "package.json must be excluded for opencode"
+        );
+    }
+
+    /// Regression (cleanup batch): a custom override switching a built-in
+    /// agent to `locN` subdirs must prune the stale builtin-layout dirs
+    /// (`.claude/home`, `.claude/data`, `.claude/root`) instead of leaving
+    /// tracked duplicates forever.
+    #[test]
+    fn override_layout_change_prunes_stale_location_dirs() {
+        let backup_root = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), "x").unwrap();
+        let cfg = cfg_for(backup_root.path());
+
+        // First: builtin-style layout via two explicit subdirs.
+        let agent_builtin_layout = AgentConfig {
+            key: "claude".into(),
+            display_name: "Claude".into(),
+            category: AgentCategory::CliCoding,
+            locations: vec![
+                AgentLocation {
+                    path: src.path().to_path_buf(),
+                    location_type: LocationType::HomeDir,
+                    kind: LocationKind::Directory,
+                    backup_subdir: ".claude/home".into(),
+                },
+                AgentLocation {
+                    path: src.path().join("data").to_path_buf(),
+                    location_type: LocationType::HomeDir,
+                    kind: LocationKind::Directory,
+                    backup_subdir: ".claude/data".into(),
+                },
+            ],
+        };
+        std::fs::create_dir_all(src.path().join("data")).unwrap();
+        std::fs::write(src.path().join("data/d.txt"), "d").unwrap();
+        let reg1 = Registry::from_agents(vec![agent_builtin_layout]);
+        backup_agents(&cfg, &reg1, &["claude".into()], None, false, false).unwrap();
+        assert!(backup_root.path().join(".claude/home/a.txt").exists());
+        assert!(backup_root.path().join(".claude/data/d.txt").exists());
+
+        // Second: same key, custom two-location config → loc0/loc1 layout.
+        let mut cfg2 = cfg_for(backup_root.path());
+        let src2 = tempdir().unwrap();
+        std::fs::write(src2.path().join("b.txt"), "y").unwrap();
+        let src3 = tempdir().unwrap();
+        std::fs::write(src3.path().join("c.txt"), "z").unwrap();
+        cfg2.agents.insert(
+            "claude".into(),
+            crate::config::CustomAgentConfig {
+                enabled: true,
+                display_name: None,
+                locations: vec![
+                    src2.path().display().to_string(),
+                    src3.path().display().to_string(),
+                ],
+                exclusions: vec![],
+            },
+        );
+        let reg2 = Registry::from_config(&cfg2).unwrap();
+        backup_agents(&cfg2, &reg2, &["claude".into()], None, false, false).unwrap();
+
+        assert!(
+            !backup_root.path().join(".claude/home").exists(),
+            "stale builtin-layout dir must be pruned"
+        );
+        assert!(
+            !backup_root.path().join(".claude/data").exists(),
+            "stale builtin-layout dir must be pruned"
+        );
+        assert!(backup_root.path().join(".claude/loc0/b.txt").exists());
+        assert!(backup_root.path().join(".claude/loc1/c.txt").exists());
     }
 }

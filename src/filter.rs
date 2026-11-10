@@ -216,9 +216,15 @@ fn matches_any(patterns: &[glob::Pattern], rel_path: &Path) -> bool {
         .file_name()
         .map(|s| s.to_string_lossy())
         .unwrap_or_default();
+    // `require_literal_separator: true` matches gitignore semantics: `*`
+    // and `?` never cross `/`. With `false`, a pattern like `cache/*.txt`
+    // also matched `cache/sub/dir.txt` — over-excluding versus the
+    // `.gitignore` written into the backup repo. `**` still spans
+    // separators, and basename/component matching covers the
+    // no-slash-pattern case.
     let opts = glob::MatchOptions {
         case_sensitive: true,
-        require_literal_separator: false,
+        require_literal_separator: true,
         require_literal_leading_dot: false,
     };
     for pat in patterns {

@@ -6,7 +6,7 @@
 
 use crate::error::{CasbError, Result};
 use crate::util::{home_dir, run_capture, run_capture_timeout, which};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -169,9 +169,11 @@ fn install_systemd(interval: Interval) -> Result<()> {
     let dir = systemd_user_dir()?;
     std::fs::create_dir_all(&dir)?;
     let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("casb"));
+    // ExecStart is parsed by systemd, not a shell — quote the binary path
+    // so installs under directories containing spaces still work.
     let service = format!(
-        "[Unit]\nDescription=casb backup\n\n[Service]\nType=oneshot\nExecStart={bin} backup\n",
-        bin = bin.display(),
+        "[Unit]\nDescription=casb backup\n\n[Service]\nType=oneshot\nExecStart={} backup\n",
+        systemd_quote(&bin),
     );
     std::fs::write(dir.join(SYSTEMD_SERVICE_NAME), service)?;
     let timer = format!(
@@ -231,10 +233,12 @@ fn install_cron(interval: Interval) -> Result<()> {
         ));
     }
     let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("casb"));
+    // The crontab line is executed by `/bin/sh` — an unquoted path with
+    // spaces would split into multiple arguments and the job would fail.
     let new_line = format!(
         "{cron} {bin} backup {tag}",
         cron = interval.cron_line(),
-        bin = bin.display(),
+        bin = shell_quote(&bin),
         tag = CRON_TAG,
     );
     let existing = read_crontab()?;
@@ -373,9 +377,46 @@ fn task_scheduler_trigger() -> Result<Option<String>> {
     Ok(Some("installed".to_string()))
 }
 
+// ---- quoting helpers ----
+
+/// Quote `path` for a POSIX shell command line (crontab entries). Paths
+/// without whitespace or quotes pass through unchanged.
+fn shell_quote(path: &Path) -> String {
+    let s = path.display().to_string();
+    if !s.contains(|c: char| c.is_whitespace() || c == '\'' || c == '"') {
+        return s;
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Quote `path` for a systemd `ExecStart=` line. systemd parses its own
+/// quoting (not shell quoting); paths without whitespace or quotes pass
+/// through unchanged.
+fn systemd_quote(path: &Path) -> String {
+    let s = path.display().to_string();
+    if !s.contains(|c: char| c.is_whitespace() || c == '"' || c == '\\') {
+        return s;
+    }
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoting_handles_spaces_and_quotes() {
+        let plain = PathBuf::from("/usr/local/bin/casb");
+        assert_eq!(shell_quote(&plain), "/usr/local/bin/casb");
+        assert_eq!(systemd_quote(&plain), "/usr/local/bin/casb");
+
+        let spaced = PathBuf::from("/opt/my tools/casb");
+        assert_eq!(shell_quote(&spaced), "'/opt/my tools/casb'");
+        assert_eq!(systemd_quote(&spaced), "\"/opt/my tools/casb\"");
+
+        let squote = PathBuf::from("/opt/it's/casb");
+        assert_eq!(shell_quote(&squote), "'/opt/it'\\''s/casb'");
+    }
 
     #[test]
     fn parse_method_variants() {

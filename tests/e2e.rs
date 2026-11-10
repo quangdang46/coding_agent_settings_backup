@@ -45,7 +45,6 @@ output_format = "text"
 [backup]
 exclusions = ["*.log", "*.tmp", "*.sqlite3-wal", "*.sqlite3-shm"]
 use_rsync = false
-checksum_verify = false
 
 [schedule]
 method = "systemd"

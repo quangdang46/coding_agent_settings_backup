@@ -420,18 +420,18 @@ mod tests {
     /// Regression: a restore must never delete files that the backup
     /// deliberately excludes.
     ///
-    /// `projects/`, `cache/`, `history.jsonl` and friends are excluded from
-    /// every backup, so they are absent from the backup tree. A restore that
-    /// syncs with an empty filter treats every absent file as "deleted" and
-    /// wipes them from the live source directory.
+    /// `sessions/`, `cache/`, `history.jsonl` and friends are excluded from
+    /// backups, so they are absent from the backup tree. A restore that
+    /// syncs with an empty filter treats every absent file as "deleted"
+    /// and wipes them from the live source directory.
     #[test]
     fn restore_does_not_delete_excluded_files() {
         let backup_root = tempdir().unwrap();
         let src = tempdir().unwrap();
-        std::fs::create_dir_all(src.path().join("projects")).unwrap();
+        std::fs::create_dir_all(src.path().join("sessions")).unwrap();
         std::fs::create_dir_all(src.path().join("cache")).unwrap();
         std::fs::write(src.path().join("settings.json"), "{}").unwrap();
-        std::fs::write(src.path().join("projects/big.txt"), "IMPORTANT").unwrap();
+        std::fs::write(src.path().join("sessions/big.txt"), "IMPORTANT").unwrap();
         std::fs::write(src.path().join("cache/c.txt"), "cache").unwrap();
 
         let mut cfg = cfg_for(backup_root.path());
@@ -442,14 +442,14 @@ mod tests {
 
         backup_agents(&cfg, &reg, &["re".into()], None, false, false).unwrap();
         assert!(
-            !backup_root.path().join(".re/projects/big.txt").exists(),
+            !backup_root.path().join(".re/sessions/big.txt").exists(),
             "excluded file must not be in the backup"
         );
 
         let (_preview, outcome) = restore_agent(&cfg, resolved, None, true, false).unwrap();
         assert!(outcome.applied);
         assert!(
-            src.path().join("projects/big.txt").exists(),
+            src.path().join("sessions/big.txt").exists(),
             "restore must not delete excluded files from the source"
         );
         assert!(

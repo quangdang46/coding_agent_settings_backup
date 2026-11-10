@@ -143,22 +143,6 @@ pub fn run_capture_timeout<S: AsRef<OsStr>>(
     }
 }
 
-/// Run a subprocess and return its captured stdout as a string.
-///
-/// Fails with [`CasbError::CommandFailed`] on non-zero exit status.
-pub fn run_check<S: AsRef<OsStr>>(program: S, args: &[&str]) -> Result<String> {
-    let output = run_capture(program.as_ref(), args)?;
-    if !output.status.success() {
-        let mut argv = vec![program.as_ref().to_string_lossy().into_owned()];
-        argv.extend(args.iter().map(|s| (*s).to_owned()));
-        return Err(CasbError::CommandFailed {
-            command: argv.join(" "),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
 /// Check whether an executable is available on `$PATH`.
 ///
 /// On Windows the bare name is checked first, then common executable
@@ -184,17 +168,6 @@ pub fn which(program: &str) -> bool {
         }
     }
     false
-}
-
-/// Make a path absolute relative to the current working directory.
-pub fn absolutise(path: impl AsRef<Path>) -> Result<PathBuf> {
-    let p = path.as_ref();
-    if p.is_absolute() {
-        Ok(p.to_path_buf())
-    } else {
-        let cwd = std::env::current_dir()?;
-        Ok(cwd.join(p))
-    }
 }
 
 #[cfg(test)]

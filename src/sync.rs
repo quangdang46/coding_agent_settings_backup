@@ -22,8 +22,6 @@ pub struct SyncStats {
     pub files_skipped: usize,
     /// Total bytes copied.
     pub bytes_copied: u64,
-    /// Whether the rsync backend was used.
-    pub used_rsync: bool,
 }
 
 impl SyncStats {
@@ -32,7 +30,6 @@ impl SyncStats {
         self.files_copied += other.files_copied;
         self.files_skipped += other.files_skipped;
         self.bytes_copied += other.bytes_copied;
-        self.used_rsync = self.used_rsync || other.used_rsync;
     }
 }
 
@@ -203,6 +200,62 @@ pub fn prune_stale_subdirs(
         {
             std::fs::remove_dir_all(entry.path())?;
             removed.push(name_str);
+        }
+    }
+    Ok(removed)
+}
+
+/// Remove stale per-location subdirectories *inside* an agent's top-level
+/// backup dir. [`prune_stale_subdirs`] only guards the top level (`.claude`);
+/// a custom override of a built-in agent or a layout change can leave
+/// nested dirs like `.claude/home` that no location maps to anymore —
+/// tracked duplicates that would be restored forever.
+///
+/// For every location subdir of the form `<top>/<name>` the `<name>` child
+/// of `<top>` is allowed; any other directory child is removed. Returns
+/// repo-relative paths of removed dirs so the caller can stage the
+/// deletions.
+pub fn prune_stale_location_subdirs(
+    agents: &[&AgentConfig],
+    backup_root: &Path,
+) -> Result<Vec<String>> {
+    // parent repo-relative dir -> allowed child dir names
+    let mut allowed: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for agent in agents {
+        for loc in &agent.locations {
+            let sub = loc.backup_subdir.trim_end_matches('/');
+            if let Some((parent, child)) = sub.rsplit_once('/') {
+                if parent.is_empty() || child.is_empty() {
+                    continue;
+                }
+                allowed
+                    .entry(parent.to_string())
+                    .or_default()
+                    .insert(child.to_string());
+            }
+        }
+    }
+
+    let mut removed = Vec::new();
+    for (parent, children) in &allowed {
+        let dir = backup_root.join(parent);
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == ".git" || name == ".gitignore" || name == ".casbignore" {
+                continue;
+            }
+            // Only directories are candidates — files directly under the
+            // top-level dir belong to flat-layout locations.
+            if !entry.file_type()?.is_dir() || children.contains(&name) {
+                continue;
+            }
+            std::fs::remove_dir_all(entry.path())?;
+            removed.push(format!("{parent}/{name}"));
         }
     }
     Ok(removed)
@@ -393,7 +446,6 @@ fn sync_rsync(
     Ok(SyncStats {
         files_copied,
         bytes_copied,
-        used_rsync: true,
         ..Default::default()
     })
 }

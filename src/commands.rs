@@ -36,8 +36,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         None => Config::load()?,
     };
     let registry = Registry::from_config(&cfg)?;
-    let format = cli.effective_format();
-    let mut printer = Printer::new(format, cli.quiet, cli.verbose);
+    let format = cli.effective_format(Some(&cfg));
+    // Config `general.quiet`/`general.verbose` act as defaults; CLI flags
+    // can only add verbosity suppression/amplification on top.
+    let mut printer = Printer::new(
+        format,
+        cli.quiet || cfg.general.quiet,
+        cli.verbose || cfg.general.verbose,
+    );
 
     match cli.command {
         Command::Init { root } => cmd_init(&cfg, &mut printer, root.as_deref(), cli.dry_run),

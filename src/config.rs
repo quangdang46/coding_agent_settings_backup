@@ -61,10 +61,8 @@ impl Default for GeneralConfig {
 pub struct BackupConfig {
     /// Default exclusion glob patterns applied to all agents.
     pub exclusions: Vec<String>,
-    /// Use `rsync` when available (falls back to `cp -a` if false or absent).
+    /// Use `rsync` when available (falls back to a pure-Rust walkdir copy).
     pub use_rsync: bool,
-    /// Verify file checksums during sync (rsync `--checksum`).
-    pub checksum_verify: bool,
     /// Largest single file (in MiB) that may be backed up.
     ///
     /// Agent directories routinely contain reinstallable binaries — macOS
@@ -89,7 +87,6 @@ impl Default for BackupConfig {
         Self {
             exclusions: default_exclusions(),
             use_rsync: true,
-            checksum_verify: false,
             max_file_size_mb: 10,
             include_secrets: false,
         }
@@ -172,44 +169,10 @@ pub fn default_exclusions() -> Vec<String> {
         "**/session_index.jsonl".into(),
         "**/files-history/**".into(),
         "**/session-env/**".into(),
-        // ── Claude Code specific (LARGE - not user config) ────────
-        "**/projects/**".into(),
-        "projects/".into(), // rsync-compatible variant
-        "**/transcripts/**".into(),
-        "**/plans/**".into(),
-        "**/skill-learning/**".into(),
-        "**/*.jsonl".into(),
-        "**/tasks/**".into(),
-        "**/file-history/**".into(),
-        "**/backups/**".into(),
-        "**/shell_snapshots/**".into(),
-        "**/shell-snapshots/**".into(),
-        "**/shell_snapshot/**".into(),
-        "**/telemetry/**".into(),
-        "**/downloads/**".into(),
         // Skills from marketplace (can be reinstalled)
         "**/skills/**".into(),
         // Plugin marketplace data (can be reinstalled)
         "**/marketplaces/**".into(),
-        // ── Codex specific ────────────────────────────────────────
-        "**/packages/**".into(),
-        "packages/".into(), // rsync-compatible variant
-        "**/models_cache.json".into(),
-        "**/vendor_imports/**".into(),
-        "**/computer-use/**".into(),
-        "computer-use/".into(), // rsync-compatible variant
-        "**/.tmp/**".into(),
-        // ── Cursor specific (reinstallable skills) ────────────────
-        "**/skills-cursor/**".into(),
-        "skills-cursor/".into(), // rsync-compatible variant
-        // ── OpenCode specific ─────────────────────────────────────
-        "**/node_modules/**".into(),
-        "**/package-lock.json".into(),
-        "**/package.json".into(),
-        "**/snapshot/**".into(),
-        "**/tool-output/**".into(),
-        "*.db-shm".into(),
-        "*.db-wal".into(),
         // ── Python ────────────────────────────────────────────────
         "**/__pycache__/**".into(),
         "**/.venv/**".into(),
@@ -224,7 +187,11 @@ pub fn default_exclusions() -> Vec<String> {
         "plugins/".into(), // rsync-compatible variant
         // ── Large binary / generated files ────────────────────────
         "*.sqlite".into(),
-        "*.db".into(),
+        "*.sqlite3".into(),
+        "*.sqlite3-wal".into(),
+        "*.sqlite3-shm".into(),
+        "*.sqlite-shm".into(),
+        "*.sqlite-wal".into(),
         "**/goals_*.sqlite*".into(),
         "**/logs_*.sqlite*".into(),
         "**/memories_*.sqlite*".into(),
@@ -243,6 +210,65 @@ pub fn default_exclusions() -> Vec<String> {
         "**/*.so".into(),
         "**/*.wasm".into(),
     ]
+}
+
+/// Exclusion patterns that only apply to ONE agent, keyed by agent key.
+///
+/// These used to live in [`default_exclusions`], which meant e.g.
+/// `**/package.json` was excluded from *every* agent's backup — silently
+/// dropping files an agent legitimately stores. Agent-scoped patterns are
+/// applied only when that agent is backed up, and are written to the
+/// backup repo's `.gitignore` prefixed with the agent's top-level
+/// subdirectory so they cannot leak onto other agents' trees.
+pub fn agent_exclusions(agent_key: &str) -> Vec<String> {
+    match agent_key {
+        // Claude Code: conversation projects, transcripts, auto-generated
+        // plans/tasks, shell snapshots, telemetry, downloaded skills.
+        "claude" => vec![
+            "**/projects/**".into(),
+            "projects/".into(), // rsync-compatible variant
+            "**/transcripts/**".into(),
+            "**/plans/**".into(),
+            "**/skill-learning/**".into(),
+            "**/*.jsonl".into(),
+            "**/tasks/**".into(),
+            "**/file-history/**".into(),
+            "**/backups/**".into(),
+            "**/shell_snapshots/**".into(),
+            "**/shell-snapshots/**".into(),
+            "**/shell_snapshot/**".into(),
+            "**/telemetry/**".into(),
+            "**/downloads/**".into(),
+        ],
+        // Codex: reinstallable packages, model caches, vendored imports,
+        // computer-use binaries.
+        "codex" => vec![
+            "**/packages/**".into(),
+            "packages/".into(), // rsync-compatible variant
+            "**/models_cache.json".into(),
+            "**/vendor_imports/**".into(),
+            "**/computer-use/**".into(),
+            "computer-use/".into(), // rsync-compatible variant
+            "**/.tmp/**".into(),
+        ],
+        // Cursor: reinstallable skills bundle.
+        "cursor" => vec![
+            "**/skills-cursor/**".into(),
+            "skills-cursor/".into(), // rsync-compatible variant
+        ],
+        // OpenCode: node projects, snapshots, tool output, sqlite state.
+        "opencode" => vec![
+            "**/node_modules/**".into(),
+            "**/package-lock.json".into(),
+            "**/package.json".into(),
+            "**/snapshot/**".into(),
+            "**/tool-output/**".into(),
+            "*.db".into(),
+            "*.db-shm".into(),
+            "*.db-wal".into(),
+        ],
+        _ => vec![],
+    }
 }
 
 /// Credential-shaped filename patterns excluded from every backup unless
@@ -454,7 +480,6 @@ impl Config {
             "general.quiet" => Some(self.general.quiet.to_string()),
             "general.output_format" => Some(self.general.output_format.clone()),
             "backup.use_rsync" => Some(self.backup.use_rsync.to_string()),
-            "backup.checksum_verify" => Some(self.backup.checksum_verify.to_string()),
             "backup.exclusions" => Some(self.backup.exclusions.join(",")),
             "backup.max_file_size_mb" => Some(self.backup.max_file_size_mb.to_string()),
             "backup.include_secrets" => Some(self.backup.include_secrets.to_string()),
@@ -486,11 +511,6 @@ impl Config {
             "general.output_format" => self.general.output_format = value.to_string(),
             "backup.use_rsync" => {
                 self.backup.use_rsync = parse_bool(value).ok_or_else(|| {
-                    CasbError::InvalidArgument(format!("expected bool, got '{value}'"))
-                })?;
-            }
-            "backup.checksum_verify" => {
-                self.backup.checksum_verify = parse_bool(value).ok_or_else(|| {
                     CasbError::InvalidArgument(format!("expected bool, got '{value}'"))
                 })?;
             }
@@ -537,7 +557,6 @@ fn toml_literal_for(key: &str, value: &str) -> Result<String> {
         "general.verbose",
         "general.quiet",
         "backup.use_rsync",
-        "backup.checksum_verify",
         "backup.include_secrets",
     ];
     if BOOL_KEYS.contains(&key) {
