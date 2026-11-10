@@ -72,6 +72,16 @@ pub struct BackupConfig {
     /// otherwise be committed to the backup repo and bloat it by hundreds of
     /// megabytes. Files above this limit are skipped. `0` disables the cap.
     pub max_file_size_mb: u64,
+    /// Back up credential-shaped files (API tokens, OAuth blobs, private
+    /// keys, `.env` files) instead of excluding them.
+    ///
+    /// Defaults to `false`: casb refuses to commit known-secret filenames
+    /// (`.credentials.json`, `auth.json`, `*.pem`, `.env*`, …) into the
+    /// plaintext git backup repo, where they would persist in history even
+    /// after deletion and leak to anyone the repo is shared or pushed to.
+    /// Skipped files are reported as warnings on every backup. Set this to
+    /// `true` only if you understand the repo will contain live secrets.
+    pub include_secrets: bool,
 }
 
 impl Default for BackupConfig {
@@ -81,6 +91,7 @@ impl Default for BackupConfig {
             use_rsync: true,
             checksum_verify: false,
             max_file_size_mb: 10,
+            include_secrets: false,
         }
     }
 }
@@ -234,6 +245,55 @@ pub fn default_exclusions() -> Vec<String> {
     ]
 }
 
+/// Credential-shaped filename patterns excluded from every backup unless
+/// `backup.include_secrets = true`.
+///
+/// These cover the files AI coding agents actually use for auth —
+/// `~/.claude/.credentials.json`, `~/.codex/auth.json`,
+/// `~/.gemini/oauth_creds.json` — plus the generic secret-file shapes
+/// (`*.pem`, `*.key`, `.env*`, `id_rsa*`, `.netrc`, `hosts.yml`). casb's
+/// backup repo is plaintext git: anything committed here lands in history
+/// permanently, so the safe default is to keep secrets out entirely.
+pub fn default_secret_patterns() -> Vec<String> {
+    vec![
+        // Agent credential stores.
+        "**/.credentials.json".into(),
+        "**/credentials.json".into(),
+        "**/credentials.yaml".into(),
+        "**/credentials.yml".into(),
+        "**/credentials.toml".into(),
+        "**/auth.json".into(),
+        "**/oauth_creds.json".into(),
+        "**/oauth-credentials.json".into(),
+        "**/secrets.json".into(),
+        "**/secrets.yaml".into(),
+        "**/secrets.yml".into(),
+        // Keys, certificates and tokens.
+        "**/*.pem".into(),
+        "**/*.key".into(),
+        "**/*.p12".into(),
+        "**/*.pfx".into(),
+        "**/*.keystore".into(),
+        "**/*.jks".into(),
+        "**/*.token".into(),
+        "**/id_rsa".into(),
+        "**/id_rsa.*".into(),
+        "**/id_dsa".into(),
+        "**/id_dsa.*".into(),
+        "**/id_ecdsa".into(),
+        "**/id_ecdsa.*".into(),
+        "**/id_ed25519".into(),
+        "**/id_ed25519.*".into(),
+        // Environment files and netrc-style credential stores.
+        "**/.env".into(),
+        "**/.env.*".into(),
+        "**/.netrc".into(),
+        "**/_netrc".into(),
+        "**/hosts.yml".into(),
+        "**/hosts.yaml".into(),
+    ]
+}
+
 impl Config {
     /// Resolve the config path, honouring `CASB_CONFIG` if set.
     pub fn config_path() -> Result<PathBuf> {
@@ -278,6 +338,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CASB_OUTPUT_FORMAT") {
             self.general.output_format = v;
+        }
+        if let Ok(v) = std::env::var("CASB_INCLUDE_SECRETS") {
+            self.backup.include_secrets = parse_bool(&v).unwrap_or(self.backup.include_secrets);
         }
     }
 
@@ -394,6 +457,7 @@ impl Config {
             "backup.checksum_verify" => Some(self.backup.checksum_verify.to_string()),
             "backup.exclusions" => Some(self.backup.exclusions.join(",")),
             "backup.max_file_size_mb" => Some(self.backup.max_file_size_mb.to_string()),
+            "backup.include_secrets" => Some(self.backup.include_secrets.to_string()),
             "schedule.method" => Some(self.schedule.method.clone()),
             "schedule.interval" => Some(self.schedule.interval.clone()),
             _ => None,
@@ -437,6 +501,11 @@ impl Config {
                     ))
                 })?;
             }
+            "backup.include_secrets" => {
+                self.backup.include_secrets = parse_bool(value).ok_or_else(|| {
+                    CasbError::InvalidArgument(format!("expected bool, got '{value}'"))
+                })?;
+            }
             "schedule.method" => self.schedule.method = value.to_string(),
             "schedule.interval" => self.schedule.interval = value.to_string(),
             other => {
@@ -469,6 +538,7 @@ fn toml_literal_for(key: &str, value: &str) -> Result<String> {
         "general.quiet",
         "backup.use_rsync",
         "backup.checksum_verify",
+        "backup.include_secrets",
     ];
     if BOOL_KEYS.contains(&key) {
         return parse_bool(value)

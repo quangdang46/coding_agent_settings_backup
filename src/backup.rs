@@ -31,6 +31,10 @@ pub struct BackupOutcome {
     pub commit: Option<String>,
     /// Stats from the file sync stage.
     pub sync: SyncStats,
+    /// Non-fatal warnings for this agent (e.g. credential-shaped files that
+    /// were excluded from the backup).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// Error message, if the backup failed for this agent.
     pub error: Option<String>,
 }
@@ -90,7 +94,11 @@ pub fn backup_agents(
         }
         // Refresh the repo's .gitignore every run so that newly added
         // exclusion patterns take effect on an existing backup repo.
-        write_default_gitignore(&backup_root, &cfg.backup.exclusions)?;
+        write_default_gitignore(
+            &backup_root,
+            &cfg.backup.exclusions,
+            cfg.backup.include_secrets,
+        )?;
     }
 
     // ── Phase 1: copy files (parallelisable) ─────────────────────────
@@ -99,6 +107,7 @@ pub fn backup_agents(
             return SyncPhase {
                 installed: false,
                 stats: SyncStats::default(),
+                secrets: Vec::new(),
                 error: None,
             };
         }
@@ -108,6 +117,7 @@ pub fn backup_agents(
                 return SyncPhase {
                     installed: true,
                     stats: SyncStats::default(),
+                    secrets: Vec::new(),
                     error: Some(e.to_string()),
                 }
             }
@@ -117,19 +127,25 @@ pub fn backup_agents(
                 return SyncPhase {
                     installed: true,
                     stats: SyncStats::default(),
+                    secrets: Vec::new(),
                     error: Some(e.to_string()),
                 };
             }
         }
         match sync_agent_to_backup(agent, &backup_root, &filter, cfg.backup.use_rsync, dry_run) {
-            Ok(stats) => SyncPhase {
-                installed: true,
-                stats,
-                error: None,
-            },
+            Ok(stats) => {
+                let secrets = scan_secret_files(agent, &filter);
+                SyncPhase {
+                    installed: true,
+                    stats,
+                    secrets,
+                    error: None,
+                }
+            }
             Err(e) => SyncPhase {
                 installed: true,
                 stats: SyncStats::default(),
+                secrets: Vec::new(),
                 error: Some(e.to_string()),
             },
         }
@@ -154,19 +170,29 @@ pub fn backup_agents(
             // Scope the staging to this agent's own directories so a shared
             // repo cannot sweep one agent's files into another's commit.
             let subdirs = agent_backup_subdirs(agent);
-            let stage_result = repo.add_paths(&subdirs).and_then(|_| {
-                let msg = message.map(|s| s.to_string()).unwrap_or_else(|| {
-                    format!(
-                        "casb backup {} at {}",
-                        agent.key,
-                        Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                    )
-                });
-                if cfg.general.auto_commit {
-                    repo.commit(&msg)
-                } else {
-                    Ok(false)
-                }
+            // Drop index entries for files the current filter excludes —
+            // credential-shaped files committed before the secret
+            // exclusions existed, or anything excluded since it was first
+            // backed up. `git rm --cached` keeps the worktree copy; the
+            // staged deletion rides along in this agent's commit.
+            let untrack_result = build_agent_filter(cfg, agent, &backup_root)
+                .and_then(|f| newly_excluded_tracked(&repo, agent, &f))
+                .and_then(|stale| repo.untrack_paths(&stale));
+            let stage_result = untrack_result.and_then(|_| {
+                repo.add_paths(&subdirs).and_then(|_| {
+                    let msg = message.map(|s| s.to_string()).unwrap_or_else(|| {
+                        format!(
+                            "casb backup {} at {}",
+                            agent.key,
+                            Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                        )
+                    });
+                    if cfg.general.auto_commit {
+                        repo.commit(&msg)
+                    } else {
+                        Ok(false)
+                    }
+                })
             });
             match stage_result {
                 Ok(was_committed) => {
@@ -202,12 +228,33 @@ pub fn backup_agents(
             error = Some("not installed".to_string());
         }
 
+        // Surface credential-shaped files that were kept out of the backup.
+        // The repo is plaintext git — users must know secrets were skipped
+        // (and how to opt back in) rather than discover it in git log.
+        let mut warnings = Vec::new();
+        if !phase.secrets.is_empty() {
+            let n = phase.secrets.len();
+            let sample: Vec<&str> = phase.secrets.iter().take(5).map(String::as_str).collect();
+            let more = if n > sample.len() {
+                format!(", +{} more", n - sample.len())
+            } else {
+                String::new()
+            };
+            warnings.push(format!(
+                "{n} credential-shaped file(s) excluded from backup ({}{}); \
+                 set backup.include_secrets=true to include them",
+                sample.join(", "),
+                more
+            ));
+        }
+
         outcomes.push(BackupOutcome {
             agent: agent.key.clone(),
             installed: phase.installed,
             committed,
             commit,
             sync: stats,
+            warnings,
             error,
         });
     }
@@ -272,6 +319,8 @@ pub fn backup_agents(
 struct SyncPhase {
     installed: bool,
     stats: SyncStats,
+    /// Credential-shaped files found in the source that the filter excluded.
+    secrets: Vec<String>,
     error: Option<String>,
 }
 
@@ -322,6 +371,13 @@ pub fn build_agent_filter(
         &agent_extras,
     )?
     .with_max_file_size(max_file_size_bytes(cfg));
+    // Credential-shaped files are excluded by default: the backup repo is
+    // plaintext git, so committing `auth.json`/`*.pem`/`.env*` would leak
+    // live secrets into history permanently. `backup.include_secrets=true`
+    // opts back in.
+    if !cfg.backup.include_secrets {
+        filter.add_secret_patterns(&crate::config::default_secret_patterns())?;
+    }
     for loc in agent.installed_locations() {
         if matches!(loc.kind, crate::agent::LocationKind::Directory) {
             let candidate = loc.path.join(".casbignore");
@@ -330,6 +386,119 @@ pub fn build_agent_filter(
     }
     filter.merge_casbignore_file(&backup_root.join(".casbignore"))?;
     Ok(filter)
+}
+
+/// Repo-relative tracked paths under the agent's subdirs that the current
+/// filter excludes — i.e. files committed before an exclusion (ordinary or
+/// credential-shaped) existed. Callers untrack them so plaintext secrets
+/// and stale excluded files leave the index.
+fn newly_excluded_tracked(
+    repo: &Repo,
+    agent: &AgentConfig,
+    filter: &ExclusionFilter,
+) -> Result<Vec<String>> {
+    let subdirs = agent_backup_subdirs(agent);
+    let tracked = repo.ls_files(&subdirs)?;
+    let mut stale = Vec::new();
+    for path in tracked {
+        if let Some(rel) = location_relative_path(agent, &path) {
+            if filter.is_excluded(&rel) {
+                stale.push(path);
+            }
+        }
+    }
+    Ok(stale)
+}
+
+/// Map a repo-relative tracked path back to the path *inside* its agent
+/// location, using the longest matching `backup_subdir` prefix. Returns
+/// `None` for paths outside every known location subdir (e.g. leftovers of
+/// an old backup layout).
+fn location_relative_path(agent: &AgentConfig, repo_path: &str) -> Option<PathBuf> {
+    let mut best: Option<(&crate::agent::AgentLocation, usize)> = None;
+    for loc in &agent.locations {
+        let sub = loc.backup_subdir.trim_end_matches('/');
+        if sub.is_empty() {
+            continue;
+        }
+        let prefix = format!("{sub}/");
+        if repo_path == sub || repo_path.starts_with(&prefix) {
+            if best.map(|(_, s)| sub.len() > s).unwrap_or(true) {
+                best = Some((loc, sub.len()));
+            }
+        }
+    }
+    let (loc, _) = best?;
+    let sub = loc.backup_subdir.trim_end_matches('/');
+    let rest = repo_path.strip_prefix(sub)?.trim_start_matches('/');
+    if rest.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(rest))
+}
+
+/// Credential-shaped files in the agent's installed locations that the
+/// filter excludes. Capped for reporting; used for backup warnings and
+/// the doctor check. Paths are reported as `<backup_subdir>/<relpath>`.
+pub(crate) fn scan_secret_files(agent: &AgentConfig, filter: &ExclusionFilter) -> Vec<String> {
+    const MAX_REPORT: usize = 50;
+    let mut hits: Vec<String> = Vec::new();
+    'outer: for loc in agent.installed_locations() {
+        match loc.kind {
+            crate::agent::LocationKind::File => {
+                let name = loc
+                    .path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !name.is_empty() && filter.is_secret_excluded(Path::new(&name)) {
+                    hits.push(format!("{}/{}", loc.backup_subdir, name));
+                    if hits.len() >= MAX_REPORT {
+                        break 'outer;
+                    }
+                }
+            }
+            crate::agent::LocationKind::Directory => {
+                let walker = walkdir::WalkDir::new(&loc.path)
+                    .follow_links(false)
+                    .into_iter();
+                for entry in walker
+                    .filter_entry(|e| {
+                        if e.depth() == 0 {
+                            return true;
+                        }
+                        // Never descend into .git or into directories the
+                        // filter excludes — same pruning the sync applies.
+                        if e.file_name() == ".git" {
+                            return false;
+                        }
+                        if e.file_type().is_dir() {
+                            if let Ok(rel) = e.path().strip_prefix(&loc.path) {
+                                return !filter.is_excluded(rel);
+                            }
+                        }
+                        true
+                    })
+                    .filter_map(|e| e.ok())
+                {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let rel = match entry.path().strip_prefix(&loc.path) {
+                        Ok(r) => r.to_path_buf(),
+                        Err(_) => continue,
+                    };
+                    if filter.is_secret_excluded(&rel) {
+                        hits.push(format!("{}/{}", loc.backup_subdir, rel.display()));
+                        if hits.len() >= MAX_REPORT {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    hits
 }
 
 /// The configured per-file size cap in bytes. `0` disables the cap.
@@ -368,7 +537,7 @@ fn write_root_readme(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_default_gitignore(repo: &Path, extras: &[String]) -> Result<()> {
+fn write_default_gitignore(repo: &Path, extras: &[String], include_secrets: bool) -> Result<()> {
     let path = repo.join(".gitignore");
     let mut existing = String::new();
     if path.exists() {
@@ -376,7 +545,16 @@ fn write_default_gitignore(repo: &Path, extras: &[String]) -> Result<()> {
     }
     let mut lines: Vec<String> = existing.lines().map(|s| s.to_string()).collect();
     let defaults = crate::config::default_exclusions();
-    for pat in defaults.iter().chain(extras.iter()) {
+    // Secret patterns go into .gitignore too (when secrets are excluded) so
+    // a file that was committed before the exclusion existed — or one that
+    // appears by some other route — is never re-tracked. `**/name` gitignore
+    // syntax matches at any depth, same as the filter.
+    let secrets = if include_secrets {
+        Vec::new()
+    } else {
+        crate::config::default_secret_patterns()
+    };
+    for pat in defaults.iter().chain(extras.iter()).chain(secrets.iter()) {
         if !lines.iter().any(|l| l.trim() == pat.trim()) {
             lines.push(pat.clone());
         }
@@ -710,6 +888,7 @@ mod tests {
                 bytes_copied: 1024,
                 ..Default::default()
             },
+            warnings: vec![],
             error: None,
         };
         let s = format_outcome_text(&installed);
@@ -723,6 +902,7 @@ mod tests {
             committed: false,
             commit: None,
             sync: Default::default(),
+            warnings: vec![],
             error: None,
         };
         assert!(format_outcome_text(&not_installed).contains("not installed"));
@@ -733,8 +913,107 @@ mod tests {
             committed: false,
             commit: None,
             sync: Default::default(),
+            warnings: vec![],
             error: Some("boom".into()),
         };
         assert!(format_outcome_text(&errored).contains("boom"));
+    }
+
+    // ----- credential-shaped file exclusions (secrets bead) -----
+
+    fn tracked_files(repo: &Path, subdir: &str) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["ls-files", "--", subdir])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Regression (bead secrets-committed-plaintext-fqa): credential-shaped
+    /// files must never reach the plaintext git backup — not in the
+    /// worktree, not in the index — and the backup must warn about them.
+    #[test]
+    fn secrets_are_excluded_warned_and_untracked() {
+        let backup_root = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        for name in [
+            ".credentials.json",
+            "auth.json",
+            "server.pem",
+            "id_rsa",
+            ".env",
+            ".env.local",
+            "normal.txt",
+        ] {
+            std::fs::write(src.path().join(name), "SECRET").unwrap();
+        }
+        let cfg = cfg_for(backup_root.path());
+        let agent = make_agent("sec", src.path());
+        let reg = registry_with(&agent);
+
+        // First back up WITH secrets included so they land in history —
+        // simulating a repo created before the exclusion existed.
+        let mut cfg_with = cfg_for(backup_root.path());
+        cfg_with.backup.include_secrets = true;
+        backup_agents(&cfg_with, &reg, &["sec".into()], None, false, false).unwrap();
+        let tracked = tracked_files(backup_root.path(), ".sec");
+        assert!(tracked.contains("auth.json"), "precondition: {tracked}");
+
+        // Now back up with the default (secrets excluded).
+        let outcomes = backup_agents(
+            &cfg,
+            &reg,
+            &["sec".into()],
+            Some("no secrets"),
+            false,
+            false,
+        )
+        .unwrap();
+        let o = &outcomes[0];
+        assert!(o.error.is_none());
+        assert!(
+            !o.warnings.is_empty(),
+            "backup must warn about excluded secrets"
+        );
+        assert!(o.warnings[0].contains("credential-shaped"));
+
+        let tracked = tracked_files(backup_root.path(), ".sec");
+        for secret in [
+            ".credentials.json",
+            "auth.json",
+            "server.pem",
+            "id_rsa",
+            ".env",
+            ".env.local",
+        ] {
+            assert!(
+                !tracked.contains(secret),
+                "{secret} must be untracked: {tracked}"
+            );
+        }
+        assert!(tracked.contains("normal.txt"), "{tracked}");
+        // The worktree copies are gone too (git clean -fdX removes the
+        // now-ignored files), but the live source is untouched.
+        assert!(src.path().join("auth.json").exists());
+    }
+
+    /// `backup.include_secrets = true` opts back in: secrets are copied,
+    /// tracked, and no warning is emitted.
+    #[test]
+    fn include_secrets_backs_up_credentials() {
+        let backup_root = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::write(src.path().join("auth.json"), "{}").unwrap();
+        std::fs::write(src.path().join("notes.txt"), "n").unwrap();
+        let mut cfg = cfg_for(backup_root.path());
+        cfg.backup.include_secrets = true;
+        let agent = make_agent("sec2", src.path());
+        let reg = registry_with(&agent);
+        let outcomes = backup_agents(&cfg, &reg, &["sec2".into()], None, false, false).unwrap();
+        assert!(outcomes[0].warnings.is_empty());
+        assert!(outcomes[0].error.is_none());
+        let tracked = tracked_files(backup_root.path(), ".sec2");
+        assert!(tracked.contains("auth.json"), "{tracked}");
     }
 }

@@ -193,6 +193,9 @@ fn cmd_backup(
     } else {
         for o in &outcomes {
             p.text_line(&backup::format_outcome_text(o))?;
+            for w in &o.warnings {
+                p.text_line(&format!("warning: {} — {w}", o.agent))?;
+            }
         }
     }
     // Surface per-agent errors as a non-zero exit so CI / systemd timers /
@@ -203,7 +206,11 @@ fn cmd_backup(
         .iter()
         .filter_map(|o| o.error.as_ref().map(|e| format!("{}: {e}", o.agent)))
         .collect();
-    emit_envelope(p, "backup", failed == 0, &errors, &[], &outcomes)?;
+    let warnings: Vec<String> = outcomes
+        .iter()
+        .flat_map(|o| o.warnings.iter().map(|w| format!("{}: {w}", o.agent)))
+        .collect();
+    emit_envelope(p, "backup", failed == 0, &errors, &warnings, &outcomes)?;
     if failed > 0 {
         return Err(CasbError::BackupFailed { count: failed });
     }

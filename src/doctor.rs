@@ -65,6 +65,28 @@ pub fn run(cfg: &Config, registry: &Registry) -> Result<DoctorReport> {
         });
     }
 
+    // Credential-shaped files kept out of the backup (informational — the
+    // exclusion is intentional, but the user should know secrets exist and
+    // are NOT in the repo).
+    if !cfg.backup.include_secrets {
+        for agent in registry.installed() {
+            if let Ok(filter) = crate::backup::build_agent_filter(cfg, agent, &cfg.backup_root()) {
+                let hits = crate::backup::scan_secret_files(agent, &filter);
+                if !hits.is_empty() {
+                    checks.push(Check {
+                        name: format!("agent {} secrets excluded", agent.key),
+                        ok: true,
+                        detail: Some(format!(
+                            "{} credential-shaped file(s) not backed up \
+                             (set backup.include_secrets=true to include)",
+                            hits.len()
+                        )),
+                    });
+                }
+            }
+        }
+    }
+
     // The backup repository — fsck. All agents share a single repository, so
     // this walks it once instead of once per agent.
     let repo_path = cfg.backup_root();

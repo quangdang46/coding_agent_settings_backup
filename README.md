@@ -191,6 +191,7 @@ exclusions = ["*.log", "*.tmp", "**/cache/**", "*.sqlite3-wal*"]
 use_rsync = true
 checksum_verify = false
 max_file_size_mb = 10   # skip files larger than this; 0 = no limit
+include_secrets = false # true = also back up credential-shaped files
 
 [schedule]
 method = "systemd"    # systemd | cron | none
@@ -210,14 +211,23 @@ the settings you would otherwise have to retype, and skips the rest:
 | `*.sqlite`, `*.db`, `*.sqlite3-wal`, `*.sqlite3-shm` | Runtime state databases, not config |
 | `*.app/`, `versions/` | Downloaded application bundles and CLI binaries |
 | Files over `max_file_size_mb` | Safety net — one 250 MB binary would bloat the repo more than everything else combined |
+| Credential-shaped files (`.credentials.json`, `auth.json`, `oauth_creds.json`, `*.pem`, `*.key`, `.env*`, `id_rsa*`, `.netrc`, `hosts.yml`, …) | The backup repo is **plaintext git** — committing live secrets would leak them into history permanently. Skipped files are reported as warnings on every `casb backup`; set `backup.include_secrets = true` to opt back in |
 
 The same filter governs backup, `diff`, and `restore`, so `restore` never
 deletes a path that was deliberately left out of the backup.
+
+Per-agent `.casbignore` files and `[agents.<key>].exclusions` use a
+**subset** of gitignore syntax: comments (`#`) and blank lines are ignored,
+but `!` negation is not supported — exclusions are additive only. There is
+no way to un-exclude a path matched by a broader pattern (including the
+built-in secret exclusions); the only opt-out for secrets is the global
+`backup.include_secrets` flag.
 
 | Env var | Maps to |
 |---------|---------|
 | `CASB_BACKUP_ROOT` | `general.backup_root` |
 | `CASB_OUTPUT_FORMAT` | `general.output_format` |
+| `CASB_INCLUDE_SECRETS` | `backup.include_secrets` |
 | `CASB_CONFIG` | Config file path override |
 
 ---
@@ -249,7 +259,7 @@ deletes a path that was deliberately left out of the backup.
 
 ### Does casb back up API keys?
 
-It backs up whatever is in the agent's config directory. If keys are in config files (not env vars), they get backed up. Use `.casbignore` to exclude sensitive paths.
+Credential-shaped files are **excluded by default** (`.credentials.json`, `auth.json`, `*.pem`, `*.key`, `.env*`, `id_rsa*`, `.netrc`, `hosts.yml`, and similar) because the backup repo is plaintext git — a committed secret stays in history forever, even after `git rm`. Every `casb backup` prints a warning listing what was skipped. Set `backup.include_secrets = true` (or `CASB_INCLUDE_SECRETS=1`) if you accept that risk. Other sensitive paths can be excluded via `.casbignore` or `[agents.<key>].exclusions` — note there is no negation (`!`) support, so exclusions cannot be selectively undone.
 
 ### Can I restore to a different machine?
 

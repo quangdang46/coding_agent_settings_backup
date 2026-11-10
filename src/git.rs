@@ -132,6 +132,61 @@ impl Repo {
         }
     }
 
+    /// List paths tracked by the index under the given pathspecs
+    /// (`git ls-files -- <paths>`). Returns repo-relative paths.
+    pub fn ls_files(&self, paths: &[String]) -> Result<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec!["ls-files".to_string(), "--".to_string()];
+        args.extend(paths.iter().cloned());
+        let out = Command::new("git")
+            .current_dir(&self.path)
+            .args(&args)
+            .output()?;
+        if !out.status.success() {
+            return Ok(Vec::new());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+    }
+
+    /// Stop tracking the given paths (`git rm --cached`) while leaving the
+    /// working-tree files in place. Used to drop files that have become
+    /// excluded (e.g. credential-shaped files) so they leave the index and
+    /// the next commit records their removal. `--ignore-unmatch` makes
+    /// already-untracked paths a no-op.
+    pub fn untrack_paths(&self, paths: &[String]) -> Result<()> {
+        const CHUNK: usize = 100;
+        for chunk in paths.chunks(CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let mut args = vec![
+                "rm".to_string(),
+                "-q".to_string(),
+                "--cached".to_string(),
+                "--ignore-unmatch".to_string(),
+                "--".to_string(),
+            ];
+            args.extend(chunk.iter().cloned());
+            let out = Command::new("git")
+                .current_dir(&self.path)
+                .args(&args)
+                .output()?;
+            if !out.status.success() {
+                return Err(CasbError::GitCommand {
+                    command: format!("git rm --cached -- {}", chunk.len()),
+                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Repack the repository into a single pack file.
     ///
     /// Best-effort: a failure here never invalidates the backup itself.
