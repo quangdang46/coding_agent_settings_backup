@@ -165,6 +165,7 @@ fn cmd_restore(
     dry_run: bool,
 ) -> Result<()> {
     let agent = registry.get(key)?;
+    require_confirmation_mode(p, force, dry_run, "restore")?;
     let (preview, outcome) = restore::restore_agent(cfg, agent, reference, force, dry_run)?;
     print_preview(p, &preview)?;
     if outcome.applied {
@@ -180,6 +181,20 @@ fn cmd_restore(
         "restore",
         serde_json::json!({"preview": preview, "outcome": outcome}),
     )
+}
+
+/// Restore operations prompt for confirmation. In machine-readable modes
+/// (`--json`, `--format toon`) there is no interactive user, so a missing
+/// `--force` must fail fast with a structured error instead of blocking on
+/// stdin — the prompt itself now goes to stderr via [`crate::util::confirm`],
+/// but robot consumers should never have to answer it.
+fn require_confirmation_mode(p: &Printer, force: bool, dry_run: bool, what: &str) -> Result<()> {
+    if !force && !dry_run && !p.is_text() {
+        return Err(CasbError::other(format!(
+            "{what} requires confirmation; re-run with --force for machine-readable output"
+        )));
+    }
+    Ok(())
 }
 
 fn print_preview(p: &mut Printer, preview: &restore::RestorePreview) -> Result<()> {
@@ -434,6 +449,7 @@ fn cmd_tag(
         }
         TagAction::Restore { agent, name } => {
             let a = registry.get(&agent)?;
+            require_confirmation_mode(p, force, dry_run, "tag restore")?;
             let (preview, outcome) = restore::restore_agent(cfg, a, Some(&name), force, dry_run)?;
             print_preview(p, &preview)?;
             if outcome.applied {

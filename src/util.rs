@@ -77,12 +77,16 @@ pub fn dir_size(path: impl AsRef<Path>) -> u64 {
 /// Prompt the user with `question`. Returns `Ok(true)` if the user answers
 /// `y` or `yes`; `Ok(false)` otherwise. If `force` is true, returns
 /// `Ok(true)` without prompting.
+///
+/// The prompt is written to **stderr**, never stdout: stdout may carry a
+/// machine-readable JSON/TOON envelope and any prompt bytes there would
+/// corrupt it.
 pub fn confirm(question: &str, force: bool) -> Result<bool> {
     if force {
         return Ok(true);
     }
-    print!("{question} [y/N] ");
-    io::stdout().flush()?;
+    eprint!("{question} [y/N] ");
+    io::stderr().flush()?;
     let stdin = io::stdin();
     let mut line = String::new();
     stdin.lock().read_line(&mut line)?;
