@@ -471,9 +471,9 @@ fn toml_literal_for(key: &str, value: &str) -> Result<String> {
         "backup.checksum_verify",
     ];
     if BOOL_KEYS.contains(&key) {
-        return parse_bool(value).map(|b| b.to_string()).ok_or_else(|| {
-            CasbError::InvalidArgument(format!("expected bool, got '{value}'"))
-        });
+        return parse_bool(value)
+            .map(|b| b.to_string())
+            .ok_or_else(|| CasbError::InvalidArgument(format!("expected bool, got '{value}'")));
     }
     if key == "backup.max_file_size_mb" {
         return value
