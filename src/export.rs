@@ -4,7 +4,7 @@
 //! `-` for stdout). Import reads the archive (file path or `-` for stdin)
 //! and unpacks it under the configured backup root.
 
-use crate::agent::Registry;
+use crate::agent::{AgentConfig, Registry};
 use crate::backup::agent_repo_path;
 use crate::config::Config;
 use crate::error::{CasbError, Result};
@@ -35,6 +35,18 @@ pub fn export_agent(
         });
     }
 
+    // Fail loudly when the agent has no committed backup data. Previously
+    // the export silently produced an archive containing only `.git` —
+    // and because the repo is shared, that archive leaked every OTHER
+    // agent's history with zero of this agent's files.
+    let subdirs = crate::backup::agent_backup_subdirs(agent);
+    let repo = crate::git::Repo::new(&repo_path);
+    if repo.commit_count_for_paths(&subdirs)? == 0 {
+        return Err(CasbError::NoBackupRepo {
+            key: agent.key.clone(),
+        });
+    }
+
     let stdout_mode = matches!(dest, Some("-"));
     let resolved_path: Option<std::path::PathBuf> = if stdout_mode {
         None
@@ -53,7 +65,7 @@ pub fn export_agent(
         let stdout = io::stdout();
         let lock = stdout.lock();
         let enc = GzEncoder::new(lock, Compression::default());
-        write_tar(enc, &repo_path, &agent.key)?;
+        write_tar(enc, &repo_path, agent)?;
     } else if let Some(path) = &resolved_path {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -62,45 +74,93 @@ pub fn export_agent(
         }
         let file = File::create(path)?;
         let enc = GzEncoder::new(file, Compression::default());
-        write_tar(enc, &repo_path, &agent.key)?;
+        write_tar(enc, &repo_path, agent)?;
     }
     Ok(resolved_path)
 }
 
-fn write_tar<W: Write>(enc: GzEncoder<W>, repo_path: &Path, key: &str) -> Result<()> {
-    let agent_dir = format!(".{key}");
-    // If the agent directory exists on disk, use it directly.
-    // Otherwise, restore from git first (the backup commit removed the
-    // working tree to save disk space).
-    let need_cleanup = if repo_path.join(&agent_dir).exists() {
-        false
-    } else {
-        // Restore agent directory from git HEAD.
-        std::process::Command::new("git")
-            .current_dir(repo_path)
-            .args(["checkout", "HEAD", "--", &agent_dir])
-            .output()?;
-        true
-    };
+fn write_tar<W: Write>(enc: GzEncoder<W>, repo_path: &Path, agent: &AgentConfig) -> Result<()> {
+    // The agent's data lives under its *actual* backup subdirectories
+    // (`.qwen` for qwencode, `.amazonq` for amazonq, `.claude` for the
+    // multi-location Claude agent) — never a guessed `.{key}`. Deriving
+    // the name from the key produced a `git checkout` that failed
+    // silently and an archive with no agent files at all.
+    let subdirs = crate::backup::agent_backup_subdirs(agent);
+
+    // Materialise each subdirectory: use the working tree when it holds
+    // the data, otherwise restore it from git HEAD (the backup may have
+    // removed working-tree files, or `git clean -fdX` may have left only
+    // an empty husk behind).
+    let mut restored: Vec<String> = Vec::new();
+    let mut present: Vec<String> = Vec::new();
+    for sub in &subdirs {
+        let dir = repo_path.join(sub);
+        let needs_checkout =
+            !dir.exists() || (dir_is_fileless(&dir) && repo_has_tracked_files(repo_path, sub));
+        if needs_checkout {
+            let status = std::process::Command::new("git")
+                .current_dir(repo_path)
+                .args(["checkout", "HEAD", "--", sub])
+                .output()?
+                .status;
+            if status.success() && dir.exists() {
+                restored.push(sub.clone());
+            }
+        }
+        if dir.exists() {
+            present.push(sub.clone());
+        }
+    }
+    if present.is_empty() {
+        return Err(CasbError::NoBackupRepo {
+            key: agent.key.clone(),
+        });
+    }
+
     let mut tar = tar::Builder::new(enc);
     // Store symlinks as symlinks rather than following them. Agent
     // directories routinely contain "latest" pointers to files that have
     // since been rotated away; following those dangling links makes tar
     // fail with "No such file or directory" and aborts the whole export.
     tar.follow_symlinks(false);
-    if repo_path.join(&agent_dir).exists() {
-        tar.append_dir_all(&agent_dir, repo_path.join(&agent_dir))?;
+    for sub in &present {
+        tar.append_dir_all(sub, repo_path.join(sub))?;
     }
     if repo_path.join(".git").exists() {
         tar.append_dir_all(".git", repo_path.join(".git"))?;
     }
     let enc = tar.into_inner()?;
     enc.finish()?;
-    // Clean up restored directory if we created it.
-    if need_cleanup {
-        let _ = std::fs::remove_dir_all(repo_path.join(&agent_dir));
+    // Clean up directories we materialised from git so the backup working
+    // tree is left exactly as we found it.
+    for sub in &restored {
+        let _ = std::fs::remove_dir_all(repo_path.join(sub));
     }
     Ok(())
+}
+
+/// Whether `dir` contains no files at any depth (only subdirectories).
+fn dir_is_fileless(dir: &Path) -> bool {
+    walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .all(|e| !e.file_type().is_file())
+}
+
+/// Whether git tracks any file under `subdir` in this repository.
+fn repo_has_tracked_files(repo_path: &Path, subdir: &str) -> bool {
+    std::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["ls-files", "--", subdir])
+        .output()
+        .map(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|l| !l.trim().is_empty())
+        })
+        .unwrap_or(false)
 }
 
 /// Import a backup archive. `source` is `None` for stdin (also accepts
@@ -551,6 +611,103 @@ mod tests {
         let dest = import_archive(&new_cfg, Some(archive.to_str().unwrap())).unwrap();
         assert!(dest.join(".e1").exists());
         assert!(dest.join(".e1/a.txt").exists());
+    }
+
+    /// Regression (bead export-wrong-subdir-silent-yds): the exporter must
+    /// use the agent's REAL backup subdir (`.qwen` for qwencode), not a
+    /// guessed `.{key}` (`.qwencode`). It must also restore the directory
+    /// from git when the working tree lacks it, and fail loudly when the
+    /// agent has no committed data.
+    #[test]
+    fn export_uses_real_subdir_and_errors_without_commits() {
+        let backup_root = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::write(src.path().join("settings.json"), "{}").unwrap();
+        let cfg = cfg_for(backup_root.path());
+        // Mimic the built-in qwencode agent: key `qwencode`, data under
+        // `.qwen` — `.{key}` would be `.qwencode`, which never exists.
+        let agent = AgentConfig {
+            key: "qwencode".into(),
+            display_name: "Qwen".into(),
+            category: AgentCategory::CliCoding,
+            locations: vec![AgentLocation {
+                path: src.path().to_path_buf(),
+                location_type: LocationType::HomeDir,
+                kind: LocationKind::Directory,
+                backup_subdir: ".qwen".into(),
+            }],
+        };
+        // `from_agents` preserves the explicit backup_subdir (from_config
+        // would reassign it).
+        let reg = Registry::from_agents(vec![agent]);
+        backup_agents(&cfg, &reg, &["qwencode".into()], None, false, false).unwrap();
+        assert!(backup_root.path().join(".qwen/settings.json").exists());
+
+        // Remove the working-tree copy so export must restore from HEAD.
+        std::fs::remove_dir_all(backup_root.path().join(".qwen")).unwrap();
+
+        let archive_dir = tempdir().unwrap();
+        let archive = archive_dir.path().join("qwen.tar.gz");
+        let path = export_agent(&cfg, &reg, "qwencode", Some(archive.to_str().unwrap())).unwrap();
+        assert!(path.is_some());
+        assert!(archive.exists());
+        let out = std::process::Command::new("tar")
+            .args(["tzf", archive.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let listing = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            listing.contains(".qwen/settings.json"),
+            "archive must contain the real subdir: {listing}"
+        );
+        assert!(
+            !listing.contains(".qwencode"),
+            "archive must not contain a guessed subdir: {listing}"
+        );
+        // The working tree must be restored to its prior state (no .qwen).
+        assert!(!backup_root.path().join(".qwen").exists());
+    }
+
+    /// An agent with zero commits touching its subdirs must fail export —
+    /// never produce a repo-only archive.
+    #[test]
+    fn export_errors_when_agent_has_no_commits() {
+        let backup_root = tempdir().unwrap();
+        let src_a = tempdir().unwrap();
+        let src_b = tempdir().unwrap();
+        std::fs::write(src_a.path().join("a.txt"), "a").unwrap();
+        std::fs::write(src_b.path().join("b.txt"), "b").unwrap();
+        let cfg = cfg_for(backup_root.path());
+        let agent_a = AgentConfig {
+            key: "ea".into(),
+            display_name: "ea".into(),
+            category: AgentCategory::CliCoding,
+            locations: vec![AgentLocation {
+                path: src_a.path().to_path_buf(),
+                location_type: LocationType::HomeDir,
+                kind: LocationKind::Directory,
+                backup_subdir: ".ea".into(),
+            }],
+        };
+        let agent_b = AgentConfig {
+            key: "eb".into(),
+            display_name: "eb".into(),
+            category: AgentCategory::CliCoding,
+            locations: vec![AgentLocation {
+                path: src_b.path().to_path_buf(),
+                location_type: LocationType::HomeDir,
+                kind: LocationKind::Directory,
+                backup_subdir: ".eb".into(),
+            }],
+        };
+        let reg = Registry::from_agents(vec![agent_a, agent_b]);
+        // Only back up agent A; B has no commits.
+        backup_agents(&cfg, &reg, &["ea".into()], None, false, false).unwrap();
+
+        let res = export_agent(&cfg, &reg, "eb", None);
+        assert!(res.is_err(), "export of un-backed-up agent must fail");
+        // And no stray archive file was created in the cwd for default dest.
     }
 
     #[test]
