@@ -379,21 +379,47 @@ impl Registry {
             let resolved_locations: Vec<AgentLocation> = if custom.locations.is_empty() {
                 Vec::new()
             } else {
+                // Every location needs its OWN backup_subdir. Assigning the
+                // same `.{key}` to all of them made each location sync into
+                // the same directory: the walkdir prune then deleted the
+                // previous location's files, so only the last location
+                // survived — silent data loss in the backup repo.
+                //
+                // A single location keeps the flat `.{key}` layout (and the
+                // backup layout existing users already have). Multiple
+                // locations nest under `.{key}/loc<N>` so they never
+                // collide; identical paths share one subdir.
+                let multi = custom.locations.len() > 1;
+                let mut subdir_by_path: std::collections::HashMap<PathBuf, String> =
+                    std::collections::HashMap::new();
                 custom
                     .locations
                     .iter()
-                    .map(|p| {
+                    .enumerate()
+                    .map(|(i, p)| {
                         let path = expand_tilde(p);
                         let kind = if path.is_file() {
                             LocationKind::File
                         } else {
                             LocationKind::Directory
                         };
+                        let backup_subdir = if !multi {
+                            format!(".{key}")
+                        } else {
+                            match subdir_by_path.get(&path) {
+                                Some(existing) => existing.clone(),
+                                None => {
+                                    let sub = format!(".{key}/loc{i}");
+                                    subdir_by_path.insert(path.clone(), sub.clone());
+                                    sub
+                                }
+                            }
+                        };
                         AgentLocation {
                             path,
                             location_type: LocationType::Custom,
                             kind,
-                            backup_subdir: format!(".{key}"),
+                            backup_subdir,
                         }
                     })
                     .collect()
@@ -488,6 +514,51 @@ mod tests {
         let reg = Registry::from_config(&cfg).unwrap();
         assert!(reg.get("myagent").is_ok());
         assert_eq!(reg.get("myagent").unwrap().display_name, "My Agent");
+    }
+
+    /// Regression (bead custom-multilocation-data-loss-zwi): every location
+    /// of a multi-location custom agent must get a DISTINCT backup_subdir.
+    /// Sharing `.{key}` made each location prune the previous one's files.
+    #[test]
+    fn multi_location_custom_agent_gets_distinct_subdirs() {
+        let mut cfg = Config::default();
+        cfg.agents.insert(
+            "multi".to_string(),
+            crate::config::CustomAgentConfig {
+                enabled: true,
+                display_name: None,
+                locations: vec!["/tmp/loc-a".into(), "/tmp/loc-b".into()],
+                exclusions: vec![],
+            },
+        );
+        let reg = Registry::from_config(&cfg).unwrap();
+        let agent = reg.get("multi").unwrap();
+        assert_eq!(agent.locations.len(), 2);
+        assert_ne!(
+            agent.locations[0].backup_subdir, agent.locations[1].backup_subdir,
+            "locations must not share a backup_subdir"
+        );
+        assert!(agent.locations[0].backup_subdir.starts_with(".multi/"));
+        assert!(agent.locations[1].backup_subdir.starts_with(".multi/"));
+        // Top-level subdir stays `.multi` so prune/history still scope right.
+        assert_eq!(agent.backup_root_subdir(), ".multi");
+    }
+
+    /// A single-location custom agent keeps the flat `.{key}` layout.
+    #[test]
+    fn single_location_custom_agent_keeps_flat_subdir() {
+        let mut cfg = Config::default();
+        cfg.agents.insert(
+            "solo".to_string(),
+            crate::config::CustomAgentConfig {
+                enabled: true,
+                display_name: None,
+                locations: vec!["/tmp/solo".into()],
+                exclusions: vec![],
+            },
+        );
+        let reg = Registry::from_config(&cfg).unwrap();
+        assert_eq!(reg.get("solo").unwrap().locations[0].backup_subdir, ".solo");
     }
 
     #[test]

@@ -375,6 +375,77 @@ mod tests {
         assert!(src.path().join("settings.json").exists());
     }
 
+    /// Regression (bead custom-multilocation-data-loss-zwi): a custom agent
+    /// with two locations must back up AND restore BOTH trees. Previously
+    /// every location shared `.key`, so the second sync pruned the first —
+    /// only the last location's data survived.
+    #[test]
+    fn multi_location_custom_agent_round_trips_all_locations() {
+        let backup_root = tempdir().unwrap();
+        let src_a = tempdir().unwrap();
+        let src_b = tempdir().unwrap();
+        std::fs::write(src_a.path().join("a.txt"), "AAA").unwrap();
+        std::fs::create_dir_all(src_a.path().join("sub")).unwrap();
+        std::fs::write(src_a.path().join("sub/a2.txt"), "A2").unwrap();
+        std::fs::write(src_b.path().join("b.txt"), "BBB").unwrap();
+
+        let cfg = cfg_for(backup_root.path());
+        // Register through the config path so the real backup_subdir
+        // assignment (per-location) is exercised, not a hand-built agent.
+        let mut reg_cfg = Config::default();
+        reg_cfg.agents.insert(
+            "multi".to_string(),
+            crate::config::CustomAgentConfig {
+                enabled: true,
+                display_name: Some("multi".into()),
+                locations: vec![
+                    src_a.path().display().to_string(),
+                    src_b.path().display().to_string(),
+                ],
+                exclusions: vec![],
+            },
+        );
+        let reg = crate::agent::Registry::from_config(&reg_cfg).unwrap();
+        backup_agents(&cfg, &reg, &["multi".into()], None, false, false).unwrap();
+
+        let subdirs: Vec<String> = reg
+            .get("multi")
+            .unwrap()
+            .locations
+            .iter()
+            .map(|l| l.backup_subdir.clone())
+            .collect();
+        assert_ne!(subdirs[0], subdirs[1]);
+        assert!(backup_root.path().join(&subdirs[0]).exists());
+        assert!(backup_root.path().join(&subdirs[1]).exists());
+        assert!(backup_root.path().join(&subdirs[0]).join("a.txt").exists());
+        assert!(backup_root
+            .path()
+            .join(&subdirs[0])
+            .join("sub/a2.txt")
+            .exists());
+        assert!(backup_root.path().join(&subdirs[1]).join("b.txt").exists());
+
+        // Wipe the sources and restore: BOTH trees must come back.
+        std::fs::remove_file(src_a.path().join("a.txt")).unwrap();
+        std::fs::remove_file(src_b.path().join("b.txt")).unwrap();
+        let resolved = reg.get("multi").unwrap();
+        let (_preview, outcome) = restore_agent(&cfg, resolved, None, true, false).unwrap();
+        assert!(outcome.applied);
+        assert_eq!(
+            std::fs::read_to_string(src_a.path().join("a.txt")).unwrap(),
+            "AAA"
+        );
+        assert_eq!(
+            std::fs::read_to_string(src_a.path().join("sub/a2.txt")).unwrap(),
+            "A2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(src_b.path().join("b.txt")).unwrap(),
+            "BBB"
+        );
+    }
+
     /// Regression: the restore preview must not list excluded paths as
     /// differences. Reporting thousands of intentionally-omitted files makes
     /// the preview useless.
