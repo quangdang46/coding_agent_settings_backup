@@ -221,7 +221,11 @@ fn sync_location_raw(
     if matches!(kind, LocationKind::File) {
         return sync_file(src, dest, filter, dry_run, direction);
     }
-    if use_rsync && util::which("rsync") {
+    // Dry-run always uses the walkdir backend: `rsync --dry-run` stats are
+    // derived from the *destination* tree, which on a fresh repo does not
+    // exist yet — the preview would report ~0 files exactly when it matters
+    // most. The walkdir path counts what *would* be copied from the source.
+    if use_rsync && !dry_run && util::which("rsync") {
         return sync_rsync(src, dest, filter, dry_run, direction);
     }
     sync_walkdir(src, dest, filter, dry_run, direction)
@@ -248,8 +252,10 @@ fn sync_file(
         });
     }
     if dry_run {
+        let bytes = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
         return Ok(SyncStats {
             files_copied: 1,
+            bytes_copied: bytes,
             ..Default::default()
         });
     }
@@ -397,6 +403,7 @@ fn sync_walkdir(
             // them.
             if dry_run {
                 stats.files_copied += 1;
+                stats.bytes_copied += entry.metadata().map(|m| m.len()).unwrap_or(0);
                 continue;
             }
             if let Some(parent) = dest_path.parent() {
@@ -407,6 +414,7 @@ fn sync_walkdir(
         } else if entry.file_type().is_file() {
             if dry_run {
                 stats.files_copied += 1;
+                stats.bytes_copied += entry.metadata().map(|m| m.len()).unwrap_or(0);
                 continue;
             }
             if let Some(parent) = dest_path.parent() {
