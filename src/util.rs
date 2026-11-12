@@ -19,12 +19,12 @@ pub fn expand_tilde(path: impl AsRef<Path>) -> PathBuf {
         None => return p.to_path_buf(),
     };
     if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
-        if let Some(home) = dirs::home_dir() {
+        if let Ok(home) = home_dir() {
             return home.join(rest);
         }
     }
     if s == "~" {
-        if let Some(home) = dirs::home_dir() {
+        if let Ok(home) = home_dir() {
             return home;
         }
     }
@@ -32,7 +32,18 @@ pub fn expand_tilde(path: impl AsRef<Path>) -> PathBuf {
 }
 
 /// Resolve the user's home directory, returning a [`CasbError`] if absent.
+///
+/// `HOME`/`USERPROFILE` take precedence over `dirs::home_dir()`: on Windows
+/// the `dirs` crate resolves the profile via the Known Folder API and
+/// ignores those env vars, which breaks sandboxed/test homes.
 pub fn home_dir() -> Result<PathBuf> {
+    for var in ["HOME", "USERPROFILE"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                return Ok(PathBuf::from(v));
+            }
+        }
+    }
     dirs::home_dir().ok_or_else(|| CasbError::Config("could not resolve $HOME".into()))
 }
 
