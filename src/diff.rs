@@ -1,14 +1,15 @@
 //! `casb diff` implementation.
 //!
 //! Compares the current state of an agent's source locations against the
-//! latest committed snapshot in its backup repository. Reuses the
-//! [`crate::restore::build_preview`] machinery against `HEAD`.
+//! latest committed snapshot in its backup repository. Uses
+//! [`crate::restore::build_preview_git`], which diffs git objects directly
+//! — no worktree checkout, no whole-tree content walk.
 
 use crate::agent::AgentConfig;
 use crate::backup::require_repo;
 use crate::config::Config;
 use crate::error::{CasbError, Result};
-use crate::restore::{build_preview, RestorePreview};
+use crate::restore::{build_preview_git, RestorePreview};
 
 /// Compute changes since the most recent backup commit.
 pub fn diff_since_last_backup(cfg: &Config, agent: &AgentConfig) -> Result<RestorePreview> {
@@ -22,11 +23,11 @@ pub fn diff_since_last_backup(cfg: &Config, agent: &AgentConfig) -> Result<Resto
     // deliberately omits are not user changes and must not show up here.
     let backup_root = cfg.backup_root();
     let filter = crate::backup::build_agent_filter(cfg, agent, &backup_root)?;
-    // Inverse of build_preview's perspective: we want changes the user has
-    // made vs the backup. The same comparator works because it categorises
-    // by presence on each side.
-    let (preview, tmp) = build_preview(&repo, agent, "HEAD", &filter)?;
-    repo.worktree_remove(tmp.path())?;
+    // Inverse of the restore preview's perspective: we want changes the
+    // user has made vs the backup. The same categorisation works because
+    // it buckets by presence on each side — and now runs entirely on git
+    // objects, with no worktree to add and remove.
+    let preview = build_preview_git(&repo, agent, "HEAD", &filter)?;
     // Swap added/removed: from the user's perspective, files in HEAD but
     // not in source are *removed* by the user; files in source but not HEAD
     // are *added* by the user.

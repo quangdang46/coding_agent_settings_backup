@@ -109,6 +109,7 @@ pub fn backup_agents(
                 installed: false,
                 stats: SyncStats::default(),
                 secrets: Vec::new(),
+                filter: None,
                 error: None,
             };
         }
@@ -119,6 +120,7 @@ pub fn backup_agents(
                     installed: true,
                     stats: SyncStats::default(),
                     secrets: Vec::new(),
+                    filter: None,
                     error: Some(e.to_string()),
                 }
             }
@@ -129,17 +131,33 @@ pub fn backup_agents(
                     installed: true,
                     stats: SyncStats::default(),
                     secrets: Vec::new(),
+                    filter: None,
                     error: Some(e.to_string()),
                 };
             }
         }
         match sync_agent_to_backup(agent, &backup_root, &filter, cfg.backup.use_rsync, dry_run) {
-            Ok(stats) => {
-                let secrets = scan_secret_files(agent, &filter);
+            Ok(mut stats) => {
+                // The walkdir backend records secret hits during the sync
+                // walk itself; rsync doesn't enumerate files, so fall back
+                // to a dedicated scan only when it actually ran.
+                let rsync_used = cfg.backup.use_rsync
+                    && !dry_run
+                    && crate::util::which("rsync")
+                    && agent
+                        .locations
+                        .iter()
+                        .any(|l| matches!(l.kind, crate::agent::LocationKind::Directory));
+                let secrets = if rsync_used {
+                    scan_secret_files(agent, &filter)
+                } else {
+                    std::mem::take(&mut stats.secret_files)
+                };
                 SyncPhase {
                     installed: true,
                     stats,
                     secrets,
+                    filter: Some(filter),
                     error: None,
                 }
             }
@@ -147,6 +165,7 @@ pub fn backup_agents(
                 installed: true,
                 stats: SyncStats::default(),
                 secrets: Vec::new(),
+                filter: None,
                 error: Some(e.to_string()),
             },
         }
@@ -180,9 +199,13 @@ pub fn backup_agents(
             // are always untracked — leaving them in the index would keep
             // plaintext secrets in every future commit. This stages a
             // deletion, which is correct regardless of auto_commit.
-            let untrack_result = build_agent_filter(cfg, agent, &backup_root)
-                .and_then(|f| newly_excluded_tracked(&repo, agent, &f))
-                .and_then(|stale| repo.untrack_paths(&stale));
+            let untrack_result = match &phase.filter {
+                Some(f) => newly_excluded_tracked(&repo, agent, f)
+                    .and_then(|stale| repo.untrack_paths(&stale)),
+                // No filter was built (agent not installed / sync failed) —
+                // there is nothing meaningful to untrack.
+                None => Ok(()),
+            };
             let stage_result = if cfg.general.auto_commit {
                 untrack_result.and_then(|_| {
                     repo.add_paths(&subdirs).and_then(|_| {
@@ -208,7 +231,12 @@ pub fn backup_agents(
                     committed = was_committed;
                     // Report the agent's *own* most recent commit, never the
                     // shared HEAD (which may belong to a different agent).
-                    commit = repo.last_commit_for_paths(&subdirs)?;
+                    // A git failure here must not abort the remaining
+                    // agents — record it like any other per-agent error.
+                    match repo.last_commit_for_paths(&subdirs) {
+                        Ok(c) => commit = c,
+                        Err(e) => error = Some(e.to_string()),
+                    }
                 }
                 Err(e) => error = Some(e.to_string()),
             }
@@ -216,8 +244,20 @@ pub fn backup_agents(
 
         // Count files actually tracked by git (after exclusions), not the
         // temporary rsync count which includes files that gitignore drops.
-        let stats = if !dry_run && error.is_none() {
-            crate::sync::count_git_tracked(&backup_root, &agent.backup_root_subdir())?
+        // Only meaningful when auto_commit staged the files — with
+        // auto_commit=false nothing was committed, so the sync-phase stats
+        // (what was actually copied) are the honest numbers and the per-
+        // agent `git ls-files` + per-file stat recount is skipped entirely.
+        // Same per-agent error policy as above: one agent's git failure
+        // must not abort the whole multi-agent backup.
+        let stats = if cfg.general.auto_commit && !dry_run && error.is_none() {
+            match crate::sync::count_git_tracked(&backup_root, &agent.backup_root_subdir()) {
+                Ok(s) => s,
+                Err(e) => {
+                    error = Some(e.to_string());
+                    phase.stats.clone()
+                }
+            }
         } else {
             phase.stats.clone()
         };
@@ -274,7 +314,7 @@ pub fn backup_agents(
         // plugins/, computer-use/) that rsync may have copied but git
         // refused to track — keeps backup root lean (~MB not GB).
         if std::env::var("CASB_DEBUG_CLEAN").is_ok() {
-            let out = std::process::Command::new("git")
+            let out = crate::git::git_command()
                 .current_dir(&backup_root)
                 .args(["clean", "-fdX", "-n"])
                 .output()
@@ -303,17 +343,19 @@ pub fn backup_agents(
         }
 
         // Prune stale agent subdirs after all agents have synced. The set of
-        // live directories is derived from *every installed agent*, not just
-        // the ones in this run: backing up a single agent must not delete
-        // another installed agent's directory from the working tree. Compare
-        // top-level names: a multi-location agent such as Claude stores its
-        // data under `.claude/home`, `.claude/data` and `.claude/root`, and
+        // live directories is derived from *every known agent* — installed
+        // or not — not just the ones in this run: an uninstalled agent
+        // keeps its backup history on disk (sync.rs documents this), so
+        // pruning its directory here would destroy commits `casb` still
+        // advertises via `list`/`history`/`restore`. Compare top-level
+        // names: a multi-location agent such as Claude stores its data
+        // under `.claude/home`, `.claude/data` and `.claude/root`, and
         // matching the full subdirectory path would make `.claude` look
         // stale and delete the agent's whole backup.
-        let installed: Vec<&AgentConfig> = registry.installed().collect();
-        let known_subdirs: HashSet<String> = installed
+        let all_agents: Vec<&AgentConfig> = registry.all().iter().collect();
+        let known_subdirs: HashSet<String> = all_agents
             .iter()
-            .flat_map(|a| a.installed_locations())
+            .flat_map(|a| a.locations.iter())
             .map(|l| top_level_subdir(&l.backup_subdir))
             .collect();
         let pruned = crate::sync::prune_stale_subdirs(&known_subdirs, &backup_root)?;
@@ -322,7 +364,7 @@ pub fn backup_agents(
         // a built-in agent switching from the builtin layout to `locN`
         // names. Prune them too so old tracked duplicates aren't restored
         // forever.
-        let pruned_nested = crate::sync::prune_stale_location_subdirs(&installed, &backup_root)?;
+        let pruned_nested = crate::sync::prune_stale_location_subdirs(&all_agents, &backup_root)?;
         let pruned: Vec<String> = pruned.into_iter().chain(pruned_nested).collect();
         if cfg.general.auto_commit {
             // The repo-root .gitignore is rewritten every run and README.md
@@ -360,12 +402,15 @@ pub fn backup_agents(
 }
 
 /// Result of the file-copy phase for one agent.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SyncPhase {
     installed: bool,
     stats: SyncStats,
     /// Credential-shaped files found in the source that the filter excluded.
     secrets: Vec<String>,
+    /// The filter built for the sync phase — reused in Phase 2 for the
+    /// newly-excluded untrack check instead of being compiled twice.
+    filter: Option<ExclusionFilter>,
     error: Option<String>,
 }
 
@@ -960,7 +1005,7 @@ mod tests {
             !backup_root.path().join(".sized").join("big.bin").exists(),
             "oversized file must not be copied into the backup"
         );
-        let tracked = std::process::Command::new("git")
+        let tracked = crate::git::git_command()
             .current_dir(backup_root.path())
             .args(["ls-files", ".sized"])
             .output()
@@ -1026,7 +1071,7 @@ mod tests {
     // ----- credential-shaped file exclusions (secrets bead) -----
 
     fn tracked_files(repo: &Path, subdir: &str) -> String {
-        let out = std::process::Command::new("git")
+        let out = crate::git::git_command()
             .current_dir(repo)
             .args(["ls-files", "--", subdir])
             .output()
@@ -1138,7 +1183,7 @@ mod tests {
         assert!(!outcomes[0].committed);
         // Synced file exists in the worktree but NOTHING is staged.
         assert!(backup_root.path().join(".noauto/a.txt").exists());
-        let staged = std::process::Command::new("git")
+        let staged = crate::git::git_command()
             .current_dir(backup_root.path())
             .args(["diff", "--cached", "--name-only"])
             .output()
@@ -1176,7 +1221,7 @@ mod tests {
         assert!(!backup_root.path().join(".old").exists());
         assert!(backup_root.path().join(".new/new.txt").exists());
         // The deletion must be committed, not left as an unstaged change.
-        let log = std::process::Command::new("git")
+        let log = crate::git::git_command()
             .current_dir(backup_root.path())
             .args(["log", "--format=%s"])
             .output()
@@ -1186,7 +1231,7 @@ mod tests {
             log.contains("prune stale agent directories"),
             "prune must be committed: {log}"
         );
-        let status = std::process::Command::new("git")
+        let status = crate::git::git_command()
             .current_dir(backup_root.path())
             .args(["status", "--porcelain"])
             .output()

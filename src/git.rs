@@ -7,6 +7,53 @@ use crate::error::{CasbError, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Build a `git` [`Command`] with repository/config-redirecting `GIT_*`
+/// environment variables removed.
+///
+/// casb pins its own safety config (`core.hooksPath`, `core.fsmonitor`,
+/// signing off) but inherited variables such as `GIT_DIR`,
+/// `GIT_WORK_TREE`, `GIT_CONFIG`, `GIT_CONFIG_COUNT` and
+/// `GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` would silently retarget every
+/// invocation at a different repository or inject config that bypasses
+/// those pins entirely. Author/committer identity variables are kept —
+/// they only affect commit metadata, which casb already sets via `-c`.
+pub(crate) fn git_command() -> Command {
+    const KEEP: &[&str] = &[
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_AUTHOR_DATE",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_COMMITTER_DATE",
+    ];
+    let mut cmd = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        let k = key.to_string_lossy();
+        if k.starts_with("GIT_") && !KEEP.contains(&k.as_ref()) {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd
+}
+
+/// Reject git ref/tag names that could be parsed as options or escape
+/// the repository: empty, `-`-prefixed (option injection), whitespace,
+/// `.`/`..` path segments, or embedded `..` (all invalid per
+/// `git check-ref-format`).
+fn validate_refname(kind: &str, name: &str) -> Result<()> {
+    let bad = name.is_empty()
+        || name.starts_with('-')
+        || name.contains(char::is_whitespace)
+        || name.contains("..")
+        || name.split('/').any(|p| p.is_empty() || p == ".");
+    if bad {
+        return Err(CasbError::InvalidArgument(format!(
+            "unsafe git {kind}: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Handle to a git repository on disk.
 #[derive(Debug, Clone)]
 pub struct Repo {
@@ -29,7 +76,7 @@ impl Repo {
     /// (`git rev-parse --git-dir` succeeds). Used to validate archives
     /// before they are allowed to replace the backup root.
     pub fn is_valid_repo(&self) -> bool {
-        Command::new("git")
+        git_command()
             .current_dir(&self.path)
             .args(["rev-parse", "--git-dir"])
             .output()
@@ -140,10 +187,7 @@ impl Repo {
         }
         let mut args = vec!["ls-files".to_string(), "--".to_string()];
         args.extend(paths.iter().cloned());
-        let out = Command::new("git")
-            .current_dir(&self.path)
-            .args(&args)
-            .output()?;
+        let out = git_command().current_dir(&self.path).args(&args).output()?;
         if !out.status.success() {
             return Ok(Vec::new());
         }
@@ -173,10 +217,7 @@ impl Repo {
                 "--".to_string(),
             ];
             args.extend(chunk.iter().cloned());
-            let out = Command::new("git")
-                .current_dir(&self.path)
-                .args(&args)
-                .output()?;
+            let out = git_command().current_dir(&self.path).args(&args).output()?;
             if !out.status.success() {
                 return Err(CasbError::GitCommand {
                     command: format!("git rm --cached -- {}", chunk.len()),
@@ -227,7 +268,7 @@ impl Repo {
         // there are staged changes, and >1 (typically 128) on real errors
         // such as a corrupt index — which must NOT be mistaken for "has
         // changes" and sent to `git commit`.
-        let out = Command::new("git")
+        let out = git_command()
             .current_dir(&self.path)
             .args(["diff", "--cached", "--quiet"])
             .output()?;
@@ -267,6 +308,8 @@ impl Repo {
     /// Force-create a tag at an explicit target (commit-ish) with an
     /// optional annotated message.
     pub fn tag_create_at(&self, name: &str, message: Option<&str>, target: &str) -> Result<()> {
+        validate_refname("tag name", name)?;
+        validate_refname("tag target", target)?;
         match message {
             Some(msg) => {
                 run_git_in(
@@ -310,13 +353,17 @@ impl Repo {
 
     /// Delete a tag.
     pub fn tag_delete(&self, name: &str) -> Result<()> {
-        run_git_in(&self.path, &["tag", "-d", name])?;
+        validate_refname("tag name", name)?;
+        run_git_in(&self.path, &["tag", "-d", "--", name])?;
         Ok(())
     }
 
     /// Whether a given ref (commit hash, tag, branch) resolves.
     pub fn ref_exists(&self, refname: &str) -> bool {
-        Command::new("git")
+        if validate_refname("ref", refname).is_err() {
+            return false;
+        }
+        git_command()
             .current_dir(&self.path)
             .args(["rev-parse", "--verify", "--quiet", refname])
             .output()
@@ -326,7 +373,7 @@ impl Repo {
 
     /// Get the short HEAD commit hash, or `None` if no commits exist.
     pub fn head_short(&self) -> Result<Option<String>> {
-        let out = Command::new("git")
+        let out = git_command()
             .current_dir(&self.path)
             .args(["rev-parse", "--short", "HEAD"])
             .output()?;
@@ -343,7 +390,7 @@ impl Repo {
 
     /// Number of commits reachable from HEAD. Returns 0 if HEAD is unborn.
     pub fn commit_count(&self) -> Result<u64> {
-        let out = Command::new("git")
+        let out = git_command()
             .current_dir(&self.path)
             .args(["rev-list", "--count", "HEAD"])
             .output()?;
@@ -370,10 +417,7 @@ impl Repo {
             args.push("--".to_string());
             args.extend(paths.iter().cloned());
         }
-        let out = Command::new("git")
-            .current_dir(&self.path)
-            .args(&args)
-            .output()?;
+        let out = git_command().current_dir(&self.path).args(&args).output()?;
         if !out.status.success() {
             return Ok(Vec::new());
         }
@@ -393,13 +437,17 @@ impl Repo {
                 tags: Vec::new(),
             });
         }
-        // Attach tag names to each commit.
+        // Attach tag names to each commit. Bucket tags by target hash
+        // first — the old commits×tags double loop was quadratic.
         if let Ok(tag_pairs) = self.tag_pairs() {
+            let mut by_hash: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for (tag, hash) in &tag_pairs {
+                by_hash.entry(hash.as_str()).or_default().push(tag.as_str());
+            }
             for entry in entries.iter_mut() {
-                for (tag, hash) in &tag_pairs {
-                    if hash == &entry.hash {
-                        entry.tags.push(tag.clone());
-                    }
+                if let Some(tags) = by_hash.get(entry.hash.as_str()) {
+                    entry.tags = tags.iter().map(|t| (*t).to_string()).collect();
                 }
             }
         }
@@ -418,10 +466,7 @@ impl Repo {
         ];
         args.push("--".to_string());
         args.extend(paths.iter().cloned());
-        let out = Command::new("git")
-            .current_dir(&self.path)
-            .args(&args)
-            .output()?;
+        let out = git_command().current_dir(&self.path).args(&args).output()?;
         if !out.status.success() {
             return Ok(0);
         }
@@ -437,14 +482,11 @@ impl Repo {
         let mut args = vec![
             "log".to_string(),
             "-1".to_string(),
-            "--pretty=format:%h".to_string(),
+            "--pretty=format:%H".to_string(),
         ];
         args.push("--".to_string());
         args.extend(paths.iter().cloned());
-        let out = Command::new("git")
-            .current_dir(&self.path)
-            .args(&args)
-            .output()?;
+        let out = git_command().current_dir(&self.path).args(&args).output()?;
         if !out.status.success() {
             return Ok(None);
         }
@@ -458,7 +500,7 @@ impl Repo {
 
     /// `(tag_name, target_commit_hash)` pairs.
     pub fn tag_pairs(&self) -> Result<Vec<(String, String)>> {
-        let out = Command::new("git")
+        let out = git_command()
             .current_dir(&self.path)
             .args([
                 "for-each-ref",
@@ -488,11 +530,124 @@ impl Repo {
         Ok(pairs)
     }
 
+    /// `git ls-tree -r -t` for the given ref and pathspecs, as NUL-separated
+    /// records (no quoting of unusual paths). Includes tree entries so
+    /// directory structure is recoverable without a checkout.
+    pub fn ls_tree(&self, refname: &str, paths: &[String]) -> Result<Vec<TreeEntry>> {
+        validate_refname("ref", refname)?;
+        let mut args = vec![
+            "ls-tree".to_string(),
+            "-r".to_string(),
+            "-t".to_string(),
+            "-z".to_string(),
+            refname.to_string(),
+        ];
+        if !paths.is_empty() {
+            args.push("--".to_string());
+            args.extend(paths.iter().cloned());
+        }
+        let out = git_command().current_dir(&self.path).args(&args).output()?;
+        if !out.status.success() {
+            return Err(CasbError::GitCommand {
+                command: format!("git ls-tree {refname}"),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        let mut entries = Vec::new();
+        for record in out.stdout.split(|b| *b == 0) {
+            if record.is_empty() {
+                continue;
+            }
+            // "<mode> <type> <sha>\t<path>"
+            let Some(tab) = record.iter().position(|b| *b == b'\t') else {
+                continue;
+            };
+            let meta = String::from_utf8_lossy(&record[..tab]);
+            let mut parts = meta.splitn(3, ' ');
+            let (Some(mode), Some(kind), Some(sha)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            entries.push(TreeEntry {
+                mode: mode.to_string(),
+                kind: kind.to_string(),
+                sha: sha.to_string(),
+                path: String::from_utf8_lossy(&record[tab + 1..]).into_owned(),
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Contents of git blobs via one `git cat-file --batch` subprocess.
+    /// Returns one entry per requested sha (`None` for missing objects).
+    pub fn cat_file_batch(&self, shas: &[String]) -> Result<Vec<Option<Vec<u8>>>> {
+        use std::io::Write;
+        use std::process::Stdio;
+        if shas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut child = git_command()
+            .current_dir(&self.path)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            for sha in shas {
+                let _ = writeln!(stdin, "{sha}");
+            }
+        }
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            return Err(CasbError::GitCommand {
+                command: "git cat-file --batch".to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        // --batch output per object: "<sha> <type> <size>\n<contents>\n",
+        // or "<sha> missing\n" / "<sha> ambiguous\n" (two fields).
+        let buf = out.stdout;
+        let mut results = Vec::with_capacity(shas.len());
+        let mut pos = 0usize;
+        for _ in shas {
+            let Some(nl) = buf[pos..].iter().position(|b| *b == b'\n') else {
+                break;
+            };
+            let header = String::from_utf8_lossy(&buf[pos..pos + nl]).into_owned();
+            pos += nl + 1;
+            let fields: Vec<&str> = header.split(' ').collect();
+            // "<sha> <type> <size>" → object found; anything else → missing.
+            let size = if fields.len() == 3 {
+                fields[2].parse::<usize>().ok()
+            } else {
+                None
+            };
+            match size {
+                Some(size) if pos + size <= buf.len() => {
+                    results.push(Some(buf[pos..pos + size].to_vec()));
+                    pos += size;
+                    // Trailing newline after each object's contents.
+                    if pos < buf.len() && buf[pos] == b'\n' {
+                        pos += 1;
+                    }
+                }
+                _ => results.push(None),
+            }
+        }
+        // Pad if the stream ended early (shouldn't happen).
+        while results.len() < shas.len() {
+            results.push(None);
+        }
+        Ok(results)
+    }
+
     /// Run `git fsck --full --strict` and return its combined output. The
     /// command fails (Err) only on missing git/IO; integrity issues are
     /// returned as the captured stderr text.
     pub fn fsck(&self) -> Result<FsckResult> {
-        let out = Command::new("git")
+        let out = git_command()
             .current_dir(&self.path)
             .args(["fsck", "--full", "--strict"])
             .output()?;
@@ -506,7 +661,7 @@ impl Repo {
     /// Run `git diff --name-status` between two refs. Returns parsed
     /// per-path entries.
     pub fn diff_name_status(&self, from: &str, to: &str) -> Result<Vec<DiffEntry>> {
-        let out = Command::new("git")
+        let out = git_command()
             .current_dir(&self.path)
             .args(["diff", "--name-status", from, to])
             .output()?;
@@ -544,6 +699,7 @@ impl Repo {
     /// Path to a temporary worktree at the given ref. Caller must
     /// `worktree_remove` afterwards.
     pub fn worktree_add(&self, target: &Path, refname: &str) -> Result<()> {
+        validate_refname("ref", refname)?;
         let target_str = target.to_string_lossy().to_string();
         run_git_in(
             &self.path,
@@ -579,6 +735,19 @@ pub struct LogEntry {
     pub subject: String,
     /// Tag names pointing at this commit, if any.
     pub tags: Vec<String>,
+}
+
+/// One entry from `git ls-tree -r -t`.
+#[derive(Debug, Clone)]
+pub struct TreeEntry {
+    /// Git object mode (`100644`, `100755`, `120000`, `040000`, `160000`).
+    pub mode: String,
+    /// Object type (`blob`, `tree`, `commit`).
+    pub kind: String,
+    /// Object SHA-1.
+    pub sha: String,
+    /// Repo-relative path.
+    pub path: String,
 }
 
 /// One entry from `git diff --name-status`.
@@ -628,7 +797,7 @@ fn parse_status(s: &str) -> DiffStatus {
 }
 
 fn run_git_in(path: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").current_dir(path).args(args).output()?;
+    let out = git_command().current_dir(path).args(args).output()?;
     if !out.status.success() {
         return Err(CasbError::GitCommand {
             command: format!("git {}", args.join(" ")),
@@ -697,6 +866,39 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert!(log[0].tags.contains(&"v1".to_string()));
         assert_eq!(log[0].subject, "first");
+    }
+
+    #[test]
+    fn ls_tree_and_cat_file_batch_roundtrip() {
+        let dir = tempdir().unwrap();
+        let repo = Repo::new(dir.path());
+        repo.init().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/deep")).unwrap();
+        std::fs::write(dir.path().join("sub/a.txt"), "hello").unwrap();
+        std::fs::write(dir.path().join("sub/deep/b.txt"), "world").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("c").unwrap();
+
+        let entries = repo.ls_tree("HEAD", &["sub".to_string()]).unwrap();
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"sub"));
+        assert!(paths.contains(&"sub/a.txt"));
+        assert!(paths.contains(&"sub/deep"));
+        assert!(paths.contains(&"sub/deep/b.txt"));
+        // Ancestor entries outside the pathspec are not listed here, but
+        // the dir itself is — callers filter by prefix.
+        let file = entries.iter().find(|e| e.path == "sub/a.txt").unwrap();
+        assert_eq!(file.kind, "blob");
+        assert_eq!(file.mode, "100644");
+
+        let blobs = repo
+            .cat_file_batch(std::slice::from_ref(&file.sha))
+            .unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].as_deref(), Some(b"hello".as_slice()));
+        // Missing object -> None, not an error.
+        let missing = repo.cat_file_batch(&["0".repeat(40)]).unwrap();
+        assert_eq!(missing[0], None);
     }
 
     #[test]

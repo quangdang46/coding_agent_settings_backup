@@ -8,6 +8,9 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::git::Repo;
 use crate::util::dir_size;
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 /// Per-agent stats line.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -55,43 +58,63 @@ pub fn compute_stats(cfg: &Config, registry: &Registry, key: Option<&str>) -> Re
     let repo = Repo::new(&backup_root);
     let repo_exists = repo.exists();
     let repo_commits = if repo_exists { repo.commit_count()? } else { 0 };
-    // Actual on-disk size of the entire backup root (including .git + all agent
-    // subdirs). Used as the single `total_repo_bytes`.
-    let total_repo_bytes = if repo_exists {
-        dir_size(&backup_root)
+
+    // One walk over the backup tree yields BOTH the total size and every
+    // location-subdir size — previously the root was walked once for the
+    // total and then every agent subdir (and every live location) was
+    // walked again on top of that.
+    let needed_subdirs = needed_backup_subdirs(&agents);
+    let (total_repo_bytes, subdir_sizes) = if repo_exists {
+        backup_tree_sizes(&backup_root, &needed_subdirs)
     } else {
-        0
+        (0, HashMap::new())
     };
 
-    for agent in agents {
-        let source_bytes: u64 = agent.installed_locations().map(|l| dir_size(&l.path)).sum();
-        // Per-agent: size of its data subdir(s) inside the backup root only.
-        let agent_repo_bytes: u64 = agent
-            .installed_locations()
-            .map(|l| {
-                let sub = backup_root.join(&l.backup_subdir);
-                if sub.exists() {
-                    dir_size(&sub)
-                } else {
-                    0
-                }
-            })
-            .sum();
-        // Commits that actually touched this agent's directories. The shared
-        // repo's total commit count is not this agent's commit count.
-        let agent_commits = if repo_exists {
-            repo.commit_count_for_paths(&[agent.backup_root_subdir()])?
-        } else {
-            0
-        };
+    // Per-agent work (live-tree size + per-agent git history) is
+    // independent — run it on the rayon pool instead of ~2 serial passes
+    // plus one `git rev-list` subprocess per agent.
+    let per_agent: Vec<Result<(u64, u64, u64)>> = agents
+        .par_iter()
+        .map(|agent| {
+            let locs: Vec<_> = agent.installed_locations().collect();
+            let source_bytes: u64 = locs.iter().map(|l| dir_size(&l.path)).sum();
+            // Per-agent: size of its data subdir(s) inside the backup root.
+            let agent_repo_bytes: u64 = locs
+                .iter()
+                .map(|l| {
+                    let sub = l.backup_subdir.trim_end_matches('/');
+                    if sub.is_empty() || sub == "." {
+                        // A "." subdir means the whole backup root — same
+                        // as dir_size(backup_root.join(".")) did before.
+                        total_repo_bytes
+                    } else {
+                        subdir_sizes.get(sub).copied().unwrap_or(0)
+                    }
+                })
+                .sum();
+            // Commits that actually touched this agent's directories. The
+            // shared repo's total commit count is not this agent's count.
+            let agent_commits = if repo_exists {
+                repo.commit_count_for_paths(&[agent.backup_root_subdir()])?
+            } else {
+                0
+            };
+            Ok((source_bytes, agent_repo_bytes, agent_commits))
+        })
+        .collect();
+    let per_agent = per_agent.into_iter().collect::<Result<Vec<_>>>()?;
+
+    for (agent, (source_bytes, agent_repo_bytes, agent_commits)) in
+        agents.iter().zip(per_agent.iter())
+    {
         total_source += source_bytes;
         entries.push(AgentStats {
             agent: agent.key.clone(),
             installed: agent.is_installed(),
             repo_exists,
-            commits: agent_commits,
-            repo_bytes: agent_repo_bytes,
-            source_bytes,
+            commits: *agent_commits,
+            repo_bytes: *agent_repo_bytes,
+            source_bytes: *source_bytes,
         });
     }
 
@@ -103,6 +126,53 @@ pub fn compute_stats(cfg: &Config, registry: &Registry, key: Option<&str>) -> Re
         // repository's commit count — counted once, not summed per agent.
         total_commits: repo_commits,
     })
+}
+
+/// The set of location `backup_subdir`s that per-agent repo sizes are
+/// keyed by, plus whether any location maps to the repo root itself.
+fn needed_backup_subdirs(agents: &[&crate::agent::AgentConfig]) -> HashSet<String> {
+    agents
+        .iter()
+        .flat_map(|a| a.installed_locations())
+        .map(|l| l.backup_subdir.trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty() && s != ".")
+        .collect()
+}
+
+/// Walk `root` once, returning (total bytes, per-subdir bytes). Only
+/// regular files count — symlinks are not followed, matching [`dir_size`].
+fn backup_tree_sizes(root: &Path, subdirs: &HashSet<String>) -> (u64, HashMap<String, u64>) {
+    let mut total = 0u64;
+    let mut sizes: HashMap<String, u64> = subdirs.iter().map(|s| (s.clone(), 0)).collect();
+    let mut prefix = String::new();
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        total += len;
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        // Charge the file to every ancestor directory that is a known
+        // location subdir (`.claude/home`, …). Component-wise prefix
+        // building keeps separators normalised to '/'.
+        prefix.clear();
+        for comp in rel.components() {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(&comp.as_os_str().to_string_lossy());
+            if let Some(v) = sizes.get_mut(prefix.as_str()) {
+                *v += len;
+            }
+        }
+    }
+    (total, sizes)
 }
 
 #[cfg(test)]

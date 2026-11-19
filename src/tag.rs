@@ -212,7 +212,7 @@ mod tests {
             "tag {target} must point at agent A's commit {a_commit}"
         );
         let head_full = String::from_utf8_lossy(
-            &std::process::Command::new("git")
+            &crate::git::git_command()
                 .current_dir(cfg.backup_root())
                 .args(["rev-parse", "HEAD"])
                 .output()

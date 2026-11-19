@@ -21,6 +21,7 @@ use crate::stats;
 use crate::tag;
 use crate::util::format_bytes;
 use crate::verify;
+use rayon::prelude::*;
 use serde::Serialize;
 
 /// Entry point used by `main`. Loads config, builds registry, then routes to
@@ -35,7 +36,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(p) => Config::load_from(Some(p))?,
         None => Config::load()?,
     };
-    let registry = Registry::from_config(&cfg)?;
+    // Build the agent registry lazily: constructing it parses the whole
+    // agent config and touches HOME, so commands that never consult
+    // agents (completion, config, hooks, schedule, init, import) must
+    // keep working when HOME or the config is unavailable. A plain fn
+    // (not a capturing closure) so `cfg` can still be moved into
+    // `cmd_config` on the config path.
+    fn build_registry(cfg: &Config) -> Result<Registry> {
+        Registry::from_config(cfg)
+    }
     let format = cli.effective_format(Some(&cfg));
     // Config `general.quiet`/`general.verbose` act as defaults; CLI flags
     // can only add verbosity suppression/amplification on top.
@@ -53,7 +62,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             parallel,
         } => cmd_backup(
             &cfg,
-            &registry,
+            &build_registry(&cfg)?,
             &mut printer,
             &agents,
             message.as_deref(),
@@ -62,36 +71,49 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         ),
         Command::Restore { agent, reference } => cmd_restore(
             &cfg,
-            &registry,
+            &build_registry(&cfg)?,
             &mut printer,
             &agent,
             reference.as_deref(),
             cli.force,
             cli.dry_run,
         ),
-        Command::Export { agent, file } => {
-            cmd_export(&cfg, &registry, &mut printer, &agent, file.as_deref())
-        }
+        Command::Export { agent, file } => cmd_export(
+            &cfg,
+            &build_registry(&cfg)?,
+            &mut printer,
+            &agent,
+            file.as_deref(),
+        ),
         Command::Import { file } => cmd_import(&cfg, &mut printer, file.as_deref(), cli.dry_run),
-        Command::List => cmd_list(&cfg, &registry, &mut printer),
+        Command::List => cmd_list(&cfg, &build_registry(&cfg)?, &mut printer),
         Command::History { agent, limit } => {
-            cmd_history(&cfg, &registry, &mut printer, &agent, limit)
+            cmd_history(&cfg, &build_registry(&cfg)?, &mut printer, &agent, limit)
         }
-        Command::Diff { agent } => cmd_diff(&cfg, &registry, &mut printer, &agent),
-        Command::Verify { agents } => cmd_verify(&cfg, &registry, &mut printer, &agents),
+        Command::Diff { agent } => cmd_diff(&cfg, &build_registry(&cfg)?, &mut printer, &agent),
+        Command::Verify { agents } => {
+            cmd_verify(&cfg, &build_registry(&cfg)?, &mut printer, &agents)
+        }
         Command::Tag { action } => cmd_tag(
             &cfg,
-            &registry,
+            &build_registry(&cfg)?,
             &mut printer,
             action,
             cli.force,
             cli.dry_run,
         ),
-        Command::Stats { agent } => cmd_stats(&cfg, &registry, &mut printer, agent.as_deref()),
-        Command::Discover { list_only } => cmd_discover(&registry, &mut printer, list_only),
+        Command::Stats { agent } => {
+            cmd_stats(&cfg, &build_registry(&cfg)?, &mut printer, agent.as_deref())
+        }
+        Command::Discover { list_only } => cmd_discover(
+            cli.config.as_deref(),
+            &build_registry(&cfg)?,
+            &mut printer,
+            list_only,
+        ),
         Command::Schedule { action } => cmd_schedule(&mut printer, action, cli.dry_run),
         Command::Hooks { action } => cmd_hooks(&mut printer, action),
-        Command::Doctor => cmd_doctor(&cfg, &registry, &mut printer),
+        Command::Doctor => cmd_doctor(&cfg, &build_registry(&cfg)?, &mut printer),
         Command::Config { action } => {
             cmd_config(cfg, cli.config.clone(), &mut printer, action, cli.dry_run)
         }
@@ -398,34 +420,43 @@ struct ListItem {
 }
 
 fn cmd_list(cfg: &Config, registry: &Registry, p: &mut Printer) -> Result<()> {
-    let mut items = Vec::new();
     let repo_path = cfg.backup_root();
     let repo = crate::git::Repo::new(&repo_path);
     let repo_exists = repo.exists();
-    for agent in registry.all() {
-        // The backup repo is shared, so "has backup" must be answered per
-        // agent: it means this agent's own directories appear in the repo's
-        // history, not merely that the shared repository exists.
-        let subdirs = vec![agent.backup_root_subdir()];
-        let (has_backup, last) = if repo_exists {
-            let commits = repo.commit_count_for_paths(&subdirs)?;
-            (commits > 0, repo.last_commit_for_paths(&subdirs)?)
-        } else {
-            (false, None)
-        };
-        items.push(ListItem {
-            key: agent.key.clone(),
-            display_name: agent.display_name.clone(),
-            installed: agent.is_installed(),
-            has_backup,
-            last_commit: last,
-            locations: agent
-                .locations
-                .iter()
-                .map(|l| l.path.display().to_string())
-                .collect(),
-        });
-    }
+    // The per-agent lookups are two git subprocesses each (~38 serial
+    // spawns for a full registry) — they only read the shared repo, so
+    // they run concurrently on the rayon pool. Order is preserved.
+    let items = registry
+        .all()
+        .par_iter()
+        .map(|agent| -> Result<ListItem> {
+            // The backup repo is shared, so "has backup" must be answered
+            // per agent: it means this agent's own directories appear in
+            // the repo's history, not merely that the shared repository
+            // exists.
+            let subdirs = vec![agent.backup_root_subdir()];
+            let (has_backup, last) = if repo_exists {
+                let commits = repo.commit_count_for_paths(&subdirs)?;
+                (commits > 0, repo.last_commit_for_paths(&subdirs)?)
+            } else {
+                (false, None)
+            };
+            Ok(ListItem {
+                key: agent.key.clone(),
+                display_name: agent.display_name.clone(),
+                installed: agent.is_installed(),
+                has_backup,
+                last_commit: last,
+                locations: agent
+                    .locations
+                    .iter()
+                    .map(|l| l.path.display().to_string())
+                    .collect(),
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
     p.heading(&format!("{} agents", items.len()))?;
     for item in &items {
         let mark = if item.installed { "✓" } else { "•" };
@@ -550,10 +581,12 @@ fn cmd_tag(
             message,
         } => {
             let a = registry.get(&agent)?;
-            if !dry_run {
+            if dry_run {
+                p.text_line(&format!("dry-run: would tag {agent} as {name}"))?;
+            } else {
                 tag::create_tag(cfg, a, &name, message.as_deref())?;
+                p.text_line(&format!("tagged {agent} as {name}"))?;
             }
-            p.text_line(&format!("tagged {agent} as {name}"))?;
             emit_data(
                 p,
                 "tag-create",
@@ -578,10 +611,12 @@ fn cmd_tag(
         }
         TagAction::Delete { agent, name } => {
             let a = registry.get(&agent)?;
-            if !dry_run {
+            if dry_run {
+                p.text_line(&format!("dry-run: would delete tag {name} from {agent}"))?;
+            } else {
                 tag::delete_tag(cfg, a, &name)?;
+                p.text_line(&format!("deleted tag {name} from {agent}"))?;
             }
-            p.text_line(&format!("deleted tag {name} from {agent}"))?;
             emit_data(
                 p,
                 "tag-delete",
@@ -653,7 +688,12 @@ fn cmd_stats(cfg: &Config, registry: &Registry, p: &mut Printer, key: Option<&st
 
 // ----- discover -----
 
-fn cmd_discover(registry: &Registry, p: &mut Printer, _list_only: bool) -> Result<()> {
+fn cmd_discover(
+    config_arg: Option<&std::path::Path>,
+    registry: &Registry,
+    p: &mut Printer,
+    list_only: bool,
+) -> Result<()> {
     let found = discover::discover(registry)?;
     if found.is_empty() {
         p.text_line("no candidate agents found")?;
@@ -662,7 +702,70 @@ fn cmd_discover(registry: &Registry, p: &mut Printer, _list_only: bool) -> Resul
             p.text_line(&format!("{} → {} ({})", f.key, f.path.display(), f.reason))?;
         }
     }
+    // Without --list-only, offer to register each candidate as a custom
+    // agent — but only in text mode: machine-readable consumers must not
+    // be blocked on a stdin prompt.
+    if !list_only && p.is_text() && !found.is_empty() {
+        let config_path = match config_arg {
+            Some(x) => crate::util::expand_tilde(x),
+            None => Config::config_path()?,
+        };
+        for f in &found {
+            offer_discovered_agent(&config_path, f, p)?;
+        }
+    }
     emit_data(p, "discover", &found)
+}
+
+/// Interactive half of `casb discover`: ask whether to append a
+/// `[agents.<key>]` section for the found directory.
+fn offer_discovered_agent(
+    config_path: &std::path::Path,
+    f: &discover::Discovered,
+    p: &mut Printer,
+) -> Result<()> {
+    if !crate::agent::valid_agent_key(&f.key) {
+        p.text_line(&format!(
+            "skipping {} — '{}' is not a valid agent key",
+            f.path.display(),
+            f.key
+        ))?;
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(config_path).unwrap_or_default();
+    let header = format!("[agents.{}]", f.key);
+    if text.lines().any(|l| l.trim() == header) {
+        return Ok(());
+    }
+    if !crate::util::confirm(
+        &format!("add {} ({}) as a custom agent?", f.key, f.path.display()),
+        false,
+    )? {
+        return Ok(());
+    }
+    let path_lit = toml::Value::String(f.path.display().to_string()).to_string();
+    let mut out = text;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.trim().is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "{header}\nenabled = true\nlocations = [{path_lit}]\n"
+    ));
+    if let Some(parent) = config_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(config_path, out)?;
+    p.text_line(&format!(
+        "added agent '{}' to {}",
+        f.key,
+        config_path.display()
+    ))?;
+    Ok(())
 }
 
 // ----- schedule -----

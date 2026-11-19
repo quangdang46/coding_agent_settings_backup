@@ -72,7 +72,17 @@ pub fn verify_agents(cfg: &Config, registry: &Registry, keys: &[String]) -> Resu
         let mut warnings = Vec::new();
         for line in result.stderr.lines() {
             let lower = line.to_lowercase();
-            if lower.contains("error") || lower.contains("missing") || lower.contains("dangling") {
+            // `dangling` is deliberately NOT an error: routine casb
+            // operations (untracking secrets, pruning stale dirs, amended
+            // commits) leave unreachable objects that `git fsck` reports
+            // as "dangling ..." — informational only, collected as
+            // warnings below. Real integrity problems say error/missing/
+            // corrupt/fatal.
+            if lower.contains("error")
+                || lower.contains("missing")
+                || lower.contains("corrupt")
+                || lower.contains("fatal")
+            {
                 errors.push(line.to_string());
             } else if !line.trim().is_empty() {
                 warnings.push(line.to_string());

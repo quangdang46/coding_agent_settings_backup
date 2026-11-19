@@ -31,6 +31,16 @@ pub fn expand_tilde(path: impl AsRef<Path>) -> PathBuf {
     p.to_path_buf()
 }
 
+/// Existence check that does NOT follow symlinks.
+///
+/// `Path::exists` follows links, so a dangling symlink reports as missing.
+/// Agent File-kind locations may legitimately be symlinks (including
+/// dangling "latest" pointers); treating them as absent would delete
+/// their backup copy on the next sync.
+pub fn lexists(path: &Path) -> bool {
+    path.symlink_metadata().is_ok()
+}
+
 /// Resolve the user's home directory, returning a [`CasbError`] if absent.
 ///
 /// `HOME`/`USERPROFILE` take precedence over `dirs::home_dir()`: on Windows
@@ -138,7 +148,8 @@ pub fn run_capture_timeout<S: AsRef<OsStr>>(
         match child.try_wait()? {
             Some(_) => return Ok(child.wait_with_output()?),
             None => {
-                if start.elapsed() >= timeout {
+                let elapsed = start.elapsed();
+                if elapsed >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
                     let mut argv = vec![program.as_ref().to_string_lossy().into_owned()];
@@ -148,7 +159,9 @@ pub fn run_capture_timeout<S: AsRef<OsStr>>(
                         stderr: format!("timed out after {}s", timeout.as_secs()),
                     });
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                // Sleep at most the remaining budget — a fixed 50 ms tick
+                // could overshoot the deadline by a full interval.
+                std::thread::sleep(std::time::Duration::from_millis(50).min(timeout - elapsed));
             }
         }
     }

@@ -76,12 +76,18 @@ pub struct AgentConfig {
 impl AgentConfig {
     /// Determine whether at least one of the agent's locations exists on disk.
     pub fn is_installed(&self) -> bool {
-        self.locations.iter().any(|loc| loc.path.exists())
+        self.locations.iter().any(|l| crate::util::lexists(&l.path))
     }
 
     /// Iterator of locations that actually exist on disk.
+    ///
+    /// Uses a symlink-aware existence check: a dangling symlink still
+    /// counts as present, otherwise its backup copy would be treated as
+    /// stale and deleted.
     pub fn installed_locations(&self) -> impl Iterator<Item = &AgentLocation> {
-        self.locations.iter().filter(|l| l.path.exists())
+        self.locations
+            .iter()
+            .filter(|l| crate::util::lexists(&l.path))
     }
 
     /// The top-level subdirectory of the backup repo that holds this agent's
@@ -343,6 +349,18 @@ pub fn builtin_agents() -> Result<Vec<AgentConfig>> {
     Ok(agents)
 }
 
+/// Whether `key` is safe to interpolate into a backup path.
+///
+/// Custom agent keys become `backup_subdir` values (`.{key}`), so they
+/// must match `[a-z0-9_-]+` — anything else (`/`, `..`, leading `.`)
+/// would escape the agent's directory inside the backup repo.
+pub(crate) fn valid_agent_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
 /// In-memory registry of all known agents (built-in + user-configured).
 #[derive(Debug, Clone)]
 pub struct Registry {
@@ -371,6 +389,15 @@ impl Registry {
         let mut agents = builtin_agents()?;
 
         for (key, custom) in &cfg.agents {
+            // The key is interpolated verbatim into `backup_subdir`
+            // (`format!(".{key}")`), which becomes a path inside the
+            // backup repo — a key like `a/../../b` is a path traversal.
+            // Restrict custom keys to the same safe alphabet as built-ins.
+            if !valid_agent_key(key) {
+                return Err(CasbError::InvalidArgument(format!(
+                    "invalid agent key {key:?}: only [a-z0-9_-] is allowed"
+                )));
+            }
             if !custom.enabled {
                 agents.retain(|a| a.key != *key);
                 continue;
@@ -396,8 +423,19 @@ impl Registry {
                     .locations
                     .iter()
                     .enumerate()
-                    .map(|(i, p)| {
+                    .map(|(i, p)| -> Result<AgentLocation> {
                         let path = expand_tilde(p);
+                        // A relative path resolves against whatever
+                        // directory `casb` happens to be invoked from —
+                        // the same config would silently back up different
+                        // trees (or nothing) depending on cwd. Require an
+                        // absolute path or a `~` prefix.
+                        if path.is_relative() {
+                            return Err(CasbError::InvalidArgument(format!(
+                                "agent '{key}' location {p:?} is not absolute; \
+                                 use ~ or an absolute path"
+                            )));
+                        }
                         let kind = if path.is_file() {
                             LocationKind::File
                         } else {
@@ -415,14 +453,14 @@ impl Registry {
                                 }
                             }
                         };
-                        AgentLocation {
+                        Ok(AgentLocation {
                             path,
                             location_type: LocationType::Custom,
                             kind,
                             backup_subdir,
-                        }
+                        })
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>>>()?
             };
 
             if let Some(existing) = agents.iter_mut().find(|a| a.key == *key) {
@@ -573,5 +611,56 @@ mod tests {
         );
         let reg = Registry::from_config(&cfg).unwrap();
         assert!(reg.get("claude").is_err());
+    }
+
+    /// Regression (bead hz4): agent keys are interpolated into
+    /// `backup_subdir` verbatim — `a/../../b` would escape the agent's
+    /// directory inside the backup repo. Only [a-z0-9_-] is allowed.
+    #[test]
+    fn invalid_agent_keys_are_rejected() {
+        for bad in ["a/../../b", "../x", ".hidden", "a.b", "A", "", "a b", "a/b"] {
+            let mut cfg = Config::default();
+            cfg.agents.insert(
+                bad.to_string(),
+                crate::config::CustomAgentConfig {
+                    enabled: true,
+                    locations: vec!["/tmp/x".into()],
+                    ..Default::default()
+                },
+            );
+            assert!(
+                Registry::from_config(&cfg).is_err(),
+                "key {bad:?} must be rejected"
+            );
+        }
+        for good in ["my-agent_2", "x"] {
+            let mut cfg = Config::default();
+            cfg.agents.insert(
+                good.to_string(),
+                crate::config::CustomAgentConfig {
+                    enabled: true,
+                    locations: vec!["/tmp/x".into()],
+                    ..Default::default()
+                },
+            );
+            assert!(Registry::from_config(&cfg).is_ok(), "key {good:?} ok");
+        }
+    }
+
+    /// Regression (bead id9): a relative custom location resolves against
+    /// the invocation cwd — the same config would back up different trees
+    /// depending on where `casb` runs. Reject it outright.
+    #[test]
+    fn relative_custom_location_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.agents.insert(
+            "rel".to_string(),
+            crate::config::CustomAgentConfig {
+                enabled: true,
+                locations: vec!["relative/path".into()],
+                ..Default::default()
+            },
+        );
+        assert!(Registry::from_config(&cfg).is_err());
     }
 }

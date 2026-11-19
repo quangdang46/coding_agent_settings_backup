@@ -13,7 +13,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use tar::EntryType;
 
 /// Export an agent's backup repo.
@@ -72,6 +72,14 @@ pub fn export_agent(
                 std::fs::create_dir_all(parent)?;
             }
         }
+        // Never silently truncate an existing archive: an export is the
+        // user's only copy of that backup state.
+        if path.exists() {
+            return Err(CasbError::InvalidArgument(format!(
+                "export destination already exists: {} — remove it or choose another path",
+                path.display()
+            )));
+        }
         let file = File::create(path)?;
         let enc = GzEncoder::new(file, Compression::default());
         write_tar(enc, &repo_path, agent)?;
@@ -86,41 +94,39 @@ fn write_tar<W: Write>(enc: GzEncoder<W>, repo_path: &Path, agent: &AgentConfig)
     // the name from the key produced a `git checkout` that failed
     // silently and an archive with no agent files at all.
     let subdirs = crate::backup::agent_backup_subdirs(agent);
+    let repo = crate::git::Repo::new(repo_path);
+    // Pin the safety config before ANY git invocation here: an imported
+    // or hand-edited repo could carry `core.hooksPath`/`core.fsmonitor`,
+    // and `git worktree add` would execute those hooks.
+    repo.pin_safe_git_config()?;
 
-    // Materialise each subdirectory: use the working tree when it holds
-    // the data, otherwise restore it from git HEAD (the backup may have
-    // removed working-tree files, or `git clean -fdX` may have left only
-    // an empty husk behind).
-    let mut restored: Vec<String> = Vec::new();
-    let mut present: Vec<String> = Vec::new();
-    for sub in &subdirs {
-        let dir = repo_path.join(sub);
-        let needs_checkout =
-            !dir.exists() || (dir_is_fileless(&dir) && repo_has_tracked_files(repo_path, sub));
-        if needs_checkout {
-            let status = std::process::Command::new("git")
-                .current_dir(repo_path)
-                .args(["checkout", "HEAD", "--", sub])
-                .output()?
-                .status;
-            if status.success() && dir.exists() {
-                restored.push(sub.clone());
+    // Materialise HEAD into a temporary worktree — never archive the
+    // live worktree. The worktree can hold uncommitted changes (or files
+    // git never tracked, e.g. everything synced under
+    // `auto_commit = false`) that were never part of a backup commit;
+    // an archive of it would silently include state no commit covers.
+    //
+    // Residual: `.git` is still archived wholesale below, so objects
+    // committed before secret exclusions existed remain reachable inside
+    // the export — purging them requires a history rewrite
+    // (`git filter-repo`), which is out of scope for `casb export`.
+    let tmp = tempfile::tempdir()?;
+    if let Err(e) = repo.worktree_add(tmp.path(), "HEAD") {
+        let _ = repo.worktree_remove(tmp.path());
+        return Err(e);
+    }
+    let build_result = (|| -> Result<()> {
+        let mut present: Vec<String> = Vec::new();
+        for sub in &subdirs {
+            if tmp.path().join(sub).exists() {
+                present.push(sub.clone());
             }
         }
-        if dir.exists() {
-            present.push(sub.clone());
+        if present.is_empty() {
+            return Err(CasbError::NoBackupRepo {
+                key: agent.key.clone(),
+            });
         }
-    }
-    if present.is_empty() {
-        return Err(CasbError::NoBackupRepo {
-            key: agent.key.clone(),
-        });
-    }
-
-    // Build the archive inside a closure so that ANY failure still runs
-    // the cleanup below — a mid-archive error must not leave materialised
-    // directories behind in the user's backup working tree.
-    let build_result = (|| -> Result<()> {
         let mut tar = tar::Builder::new(enc);
         // Store symlinks as symlinks rather than following them. Agent
         // directories routinely contain "latest" pointers to files that have
@@ -128,7 +134,7 @@ fn write_tar<W: Write>(enc: GzEncoder<W>, repo_path: &Path, agent: &AgentConfig)
         // fail with "No such file or directory" and aborts the whole export.
         tar.follow_symlinks(false);
         for sub in &present {
-            tar.append_dir_all(sub, repo_path.join(sub))?;
+            tar.append_dir_all(sub, tmp.path().join(sub))?;
         }
         if repo_path.join(".git").exists() {
             tar.append_dir_all(".git", repo_path.join(".git"))?;
@@ -137,36 +143,10 @@ fn write_tar<W: Write>(enc: GzEncoder<W>, repo_path: &Path, agent: &AgentConfig)
         enc.finish()?;
         Ok(())
     })();
-    // Clean up directories we materialised from git so the backup working
-    // tree is left exactly as we found it — on success AND on error.
-    for sub in &restored {
-        let _ = std::fs::remove_dir_all(repo_path.join(sub));
-    }
-    build_result
-}
-
-/// Whether `dir` contains no files at any depth (only subdirectories).
-fn dir_is_fileless(dir: &Path) -> bool {
-    walkdir::WalkDir::new(dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .all(|e| !e.file_type().is_file())
-}
-
-/// Whether git tracks any file under `subdir` in this repository.
-fn repo_has_tracked_files(repo_path: &Path, subdir: &str) -> bool {
-    std::process::Command::new("git")
-        .current_dir(repo_path)
-        .args(["ls-files", "--", subdir])
-        .output()
-        .map(|o| {
-            o.status.success()
-                && String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .any(|l| !l.trim().is_empty())
-        })
-        .unwrap_or(false)
+    // Remove the worktree on success AND on error — a failed export must
+    // not leak a registered worktree or leave files in the backup root.
+    let remove_result = repo.worktree_remove(tmp.path());
+    build_result.and(remove_result)
 }
 
 /// Import a backup archive. `source` is `None` for stdin (also accepts
@@ -362,32 +342,82 @@ fn check_link_target(entry_path: &Path, target: &Path) -> Result<()> {
 ///   credential helpers, URL rewrites, interactive editors/pagers, and
 ///   `include`/`includeIf` sections that could pull in further config.
 fn sanitize_imported_tree(root: &Path) -> Result<()> {
+    let mut gitdirs: Vec<PathBuf> = Vec::new();
+    // Canonical root for containment checks on resolved symlink targets.
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
     {
-        if !entry.file_type().is_dir() || entry.file_name() != ".git" {
-            continue;
+        if entry.file_name() == ".git" {
+            if entry.file_type().is_symlink() {
+                // A `.git` symlink retargets the repository at another
+                // directory — the name-based check alone would miss it.
+                // Link targets were already verified to stay inside the
+                // staging tree at unpack time; canonicalise anyway so a
+                // `..`-laden target can never make us sanitise (i.e.
+                // delete hooks from) a directory outside the staging
+                // tree. Hooks at the resolved location are just as
+                // dangerous.
+                if let Ok(target) = std::fs::read_link(entry.path()) {
+                    let resolved = entry
+                        .path()
+                        .parent()
+                        .map(|p| p.join(&target))
+                        .unwrap_or_else(|| target.clone());
+                    if let Ok(canon) = resolved.canonicalize() {
+                        if canon.is_dir() && canon.starts_with(&root_canon) {
+                            gitdirs.push(canon);
+                        }
+                    }
+                }
+            } else if entry.file_type().is_dir() {
+                gitdirs.push(entry.path().to_path_buf());
+            }
+            // A `.git` regular file (gitfile) holds no hooks itself, and
+            // `validate_imported_repo` rejects a non-directory `.git`.
+        } else if entry.file_type().is_dir() && looks_like_gitdir(entry.path()) {
+            // `.git`-shaped directories under other names (`.git-real`,
+            // `repo.git`) get the same treatment — a `hooks/` directory
+            // there is just as dangerous once the tree is merged in.
+            gitdirs.push(entry.path().to_path_buf());
         }
-        let gitdir = entry.path().to_path_buf();
-        let hooks = gitdir.join("hooks");
-        if hooks.exists() {
-            tracing::warn!(
-                "import: removing hooks directory from imported git metadata ({})",
-                hooks.display()
-            );
-            std::fs::remove_dir_all(&hooks)?;
-        }
-        // `info/attributes` can assign filter/diff drivers; the config-side
-        // sections are stripped below, but removing the attributes file
-        // removes the other half of the pair.
-        let attrs = gitdir.join("info").join("attributes");
-        if attrs.exists() {
-            std::fs::remove_file(&attrs)?;
-        }
-        sanitize_git_config(&gitdir.join("config"))?;
     }
+    gitdirs.sort();
+    gitdirs.dedup();
+    for gitdir in gitdirs {
+        sanitize_git_dir(&gitdir)?;
+    }
+    Ok(())
+}
+
+/// Whether `dir` quacks like a git directory (`HEAD` + `objects/` +
+/// `refs/`). Catches `.git`-shaped trees stored under other names that a
+/// name-only check would miss.
+fn looks_like_gitdir(dir: &Path) -> bool {
+    dir.join("HEAD").exists() && dir.join("objects").is_dir() && dir.join("refs").is_dir()
+}
+
+/// Neutralise one git directory: remove `hooks/` and `info/attributes`,
+/// strip dangerous keys from `config`.
+fn sanitize_git_dir(gitdir: &Path) -> Result<()> {
+    let hooks = gitdir.join("hooks");
+    if hooks.exists() {
+        tracing::warn!(
+            "import: removing hooks directory from imported git metadata ({})",
+            hooks.display()
+        );
+        std::fs::remove_dir_all(&hooks)?;
+    }
+    // `info/attributes` can assign filter/diff drivers; the config-side
+    // sections are stripped below, but removing the attributes file
+    // removes the other half of the pair.
+    let attrs = gitdir.join("info").join("attributes");
+    if attrs.exists() {
+        std::fs::remove_file(&attrs)?;
+    }
+    sanitize_git_config(&gitdir.join("config"))?;
     Ok(())
 }
 

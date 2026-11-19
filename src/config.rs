@@ -302,6 +302,13 @@ pub fn default_secret_patterns() -> Vec<String> {
         "**/*.keystore".into(),
         "**/*.jks".into(),
         "**/*.token".into(),
+        "**/*.token.json".into(),
+        "**/*.asc".into(),
+        "**/*.gpg".into(),
+        "**/*.ppk".into(),
+        "**/*.p8".into(),
+        "**/*-credentials.json".into(),
+        "**/service-account*.json".into(),
         "**/id_rsa".into(),
         "**/id_rsa.*".into(),
         "**/id_dsa".into(),
@@ -418,6 +425,14 @@ impl Config {
             String::new()
         };
 
+        let dotted_key = format!("{section}.{leaf}");
+        // Does the file define this section via dotted keys
+        // (`general.backup_root = "x"`) rather than a `[general]` table?
+        // Appending a `[section]` header there would be a duplicate table
+        // definition — invalid TOML — so that case falls back to a
+        // `toml::Value` merge below.
+        let has_dotted_section_key = text.lines().any(|l| is_dotted_key_for(l, section));
+
         let mut out: Vec<String> = Vec::new();
         let mut in_section = false;
         let mut section_seen = false;
@@ -441,14 +456,27 @@ impl Config {
                 out.push(line.to_string());
                 continue;
             }
-            if in_section && !key_written && is_toml_key_line(line, leaf) {
-                out.push(format!("{leaf} = {literal}"));
-                key_written = true;
-                continue;
+            if !key_written {
+                // Dotted-key form at the top level of the document:
+                // `general.backup_root = "..."`. Only valid outside any
+                // [section] — inside one it would name a different key.
+                if !in_section && is_toml_key_line(line, &dotted_key) {
+                    out.push(format!("{dotted_key} = {literal}"));
+                    key_written = true;
+                    continue;
+                }
+                if in_section && is_toml_key_line(line, leaf) {
+                    out.push(format!("{leaf} = {literal}"));
+                    key_written = true;
+                    continue;
+                }
             }
             out.push(line.to_string());
         }
-        if !section_seen {
+        if !key_written && !section_seen {
+            if has_dotted_section_key {
+                return set_key_via_toml_value(path, key, &literal);
+            }
             if out.last().is_some_and(|l| !l.trim().is_empty()) {
                 out.push(String::new());
             }
@@ -610,6 +638,88 @@ fn is_toml_key_line(line: &str, leaf: &str) -> bool {
     false
 }
 
+/// Whether `line` assigns a dotted key under `section` — i.e. starts
+/// with `section.` followed by a key character. Used to detect configs
+/// like `general.backup_root = "x"` that have no `[general]` table at
+/// all, where appending one would produce invalid TOML.
+fn is_dotted_key_for(line: &str, section: &str) -> bool {
+    let t = line.trim_start();
+    let Some(rest) = t.strip_prefix(section) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('.') else {
+        return false;
+    };
+    // The remainder must look like `leaf = ...`: a key start followed
+    // somewhere by `=`. Comments (`# general.x = 1`) never reach here —
+    // the `#` fails the prefix match.
+    rest.chars()
+        .next()
+        .is_some_and(|c| c == '"' || c == '\'' || c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && rest.contains('=')
+}
+
+/// Fallback for configs whose section only exists as dotted keys:
+/// merge the new value through `toml::Value` so the result is always
+/// valid TOML. Comments and ordering are lost — only used when
+/// in-place patching cannot express the change safely.
+fn set_key_via_toml_value(path: &Path, key: &str, literal: &str) -> Result<()> {
+    let text = if path.exists() {
+        std::fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    let mut doc: toml::Value = if text.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&text)?
+    };
+    // `literal` is already TOML-validated by the caller; re-parse it as
+    // a value to recover the right type.
+    let wrapped: toml::Value = toml::from_str(&format!("__v = {literal}"))?;
+    let value = wrapped
+        .get("__v")
+        .cloned()
+        .unwrap_or_else(|| toml::Value::String(String::new()));
+    let parts: Vec<&str> = key.split('.').collect();
+    let table = doc
+        .as_table_mut()
+        .ok_or_else(|| CasbError::InvalidArgument("config root is not a table".into()))?;
+    set_toml_nested(table, &parts, value)?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, toml::to_string_pretty(&doc)?)?;
+    Ok(())
+}
+
+fn set_toml_nested(
+    table: &mut toml::map::Map<String, toml::Value>,
+    parts: &[&str],
+    value: toml::Value,
+) -> Result<()> {
+    match parts {
+        [leaf] => {
+            table.insert((*leaf).to_string(), value);
+            Ok(())
+        }
+        [head, rest @ ..] => {
+            let entry = table
+                .entry((*head).to_string())
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            match entry.as_table_mut() {
+                Some(t) => set_toml_nested(t, rest, value),
+                None => Err(CasbError::InvalidArgument(format!(
+                    "config key conflicts with non-table value at '{head}'"
+                ))),
+            }
+        }
+        [] => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +836,34 @@ use_rsync = true
         Config::set_key_in_file(&path, "general.backup_root", "/tmp/b").unwrap();
         let cfg = Config::load_from(Some(&path)).unwrap();
         assert_eq!(cfg.general.backup_root, "/tmp/b");
+    }
+
+    #[test]
+    fn set_key_in_file_handles_dotted_key_config() {
+        // A config that defines keys via dotted form has no `[general]`
+        // table — appending one would be a duplicate table definition.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(
+            &path,
+            "general.backup_root = \"/original\"\ngeneral.verbose = false\n",
+        )
+        .unwrap();
+
+        // Replacing the dotted key in place.
+        Config::set_key_in_file(&path, "general.backup_root", "/new").unwrap();
+        // Adding a key whose section only exists as dotted keys.
+        Config::set_key_in_file(&path, "general.quiet", "true").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The merged output must itself be valid TOML (previously the
+        // patcher appended a duplicate `[general]` table → parse error).
+        let cfg = Config::load_from(Some(&path)).unwrap();
+        assert_eq!(cfg.general.backup_root, "/new");
+        assert!(cfg.general.quiet);
+        assert!(!cfg.general.verbose);
+        // Sanity: the file parses as TOML on its own.
+        let _: toml::Value = toml::from_str(&text).unwrap();
     }
 
     #[test]

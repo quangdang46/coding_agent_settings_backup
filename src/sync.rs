@@ -22,6 +22,11 @@ pub struct SyncStats {
     pub files_skipped: usize,
     /// Total bytes copied.
     pub bytes_copied: u64,
+    /// Credential-shaped paths excluded during the walk, reported as
+    /// `<backup_subdir>/<relpath>`. Collected during the sync traversal
+    /// itself so callers don't need a second pass over the source tree.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub secret_files: Vec<String>,
 }
 
 impl SyncStats {
@@ -30,6 +35,7 @@ impl SyncStats {
         self.files_copied += other.files_copied;
         self.files_skipped += other.files_skipped;
         self.bytes_copied += other.bytes_copied;
+        self.secret_files.extend(other.secret_files.iter().cloned());
     }
 }
 
@@ -56,7 +62,10 @@ pub fn sync_agent_to_backup(
     // retains its history).
     for loc in &agent.locations {
         let dest = backup_dest_for(dest_root, loc);
-        if !loc.path.exists() {
+        // `lexists`, not `exists`: a dangling symlink File location is
+        // still a live location — `exists` would follow the link, report
+        // it missing, and delete its backup copy.
+        if !util::lexists(&loc.path) {
             if matches!(loc.kind, LocationKind::File) && !dry_run && dest.exists() {
                 remove_file_and_empty_parents(&dest, dest_root)?;
             }
@@ -80,7 +89,12 @@ pub fn sync_agent_to_backup(
                 }
             }
         }
-        let stats = sync_location(loc, &dest, filter, use_rsync, dry_run)?;
+        let mut stats = sync_location(loc, &dest, filter, use_rsync, dry_run)?;
+        // Secret hits are recorded as location-relative paths during the
+        // walk; qualify them with the backup subdir for reporting.
+        for hit in &mut stats.secret_files {
+            *hit = format!("{}/{}", loc.backup_subdir, hit);
+        }
         total.merge(&stats);
     }
     Ok(total)
@@ -127,14 +141,14 @@ pub fn sync_backup_to_agent(
         if !src.exists() {
             continue;
         }
-        if !loc.path.exists() && !dry_run {
+        if !util::lexists(&loc.path) && !dry_run {
             if matches!(loc.kind, LocationKind::Directory) {
                 std::fs::create_dir_all(&loc.path)?;
             } else if let Some(parent) = loc.path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let stats = sync_location_raw(
+        let mut stats = sync_location_raw(
             &src,
             &loc.path,
             filter,
@@ -143,6 +157,9 @@ pub fn sync_backup_to_agent(
             loc.kind,
             SyncDirection::ToSource,
         )?;
+        for hit in &mut stats.secret_files {
+            *hit = format!("{}/{}", loc.backup_subdir, hit);
+        }
         total.merge(&stats);
     }
     Ok(total)
@@ -327,20 +344,57 @@ fn sync_file(
     direction: SyncDirection,
 ) -> Result<SyncStats> {
     let basename = src.file_name().unwrap_or_default();
-    if filter.is_excluded(Path::new(basename)) {
+    let rel = Path::new(basename);
+    if filter.is_excluded(rel) {
+        let mut stats = SyncStats {
+            files_skipped: 1,
+            ..Default::default()
+        };
+        record_secret_hit(&mut stats, filter, rel, direction);
+        return Ok(stats);
+    }
+    // One symlink_metadata serves the size cap, the dry-run byte count and
+    // the symlink check — previously three separate stats per file.
+    let meta = std::fs::symlink_metadata(src).ok();
+    if direction == SyncDirection::ToBackup
+        && meta
+            .as_ref()
+            .map(|m| filter.exceeds_size_cap_meta(m))
+            .unwrap_or(false)
+    {
         return Ok(SyncStats {
             files_skipped: 1,
             ..Default::default()
         });
     }
-    if direction == SyncDirection::ToBackup && filter.exceeds_size_cap(src) {
-        return Ok(SyncStats {
-            files_skipped: 1,
-            ..Default::default()
-        });
+    // Unchanged destination: skip the rewrite entirely (rsync quick-check
+    // parity) — no bytes copied, nothing for git to see.
+    if files_unchanged(src, dest) {
+        return Ok(SyncStats::default());
     }
     if dry_run {
-        let bytes = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+        // symlink_metadata (not metadata) so a dangling symlink still
+        // reports its own size instead of following the link.
+        let bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        return Ok(SyncStats {
+            files_copied: 1,
+            bytes_copied: bytes,
+            ..Default::default()
+        });
+    }
+    // A symlinked File location must be recreated AS a symlink:
+    // `fs::copy` follows the link and would store the target's contents
+    // (or fail outright on a dangling link), losing the link structure.
+    if meta
+        .as_ref()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        copy_symlink(src, dest)?;
+        let bytes = std::fs::symlink_metadata(src).map(|m| m.len()).unwrap_or(0);
         return Ok(SyncStats {
             files_copied: 1,
             bytes_copied: bytes,
@@ -362,11 +416,85 @@ fn sync_file(
 /// `rsync -a` keeps modes, so the walkdir fallback must too or identical
 /// backups differ by backend (and executable bits are silently lost).
 fn copy_preserving(src: &Path, dest: &Path) -> Result<u64> {
+    // `fs::copy` already carries the permission bits, so the old extra
+    // metadata+set_permissions pair was two redundant syscalls per file.
+    // What it does NOT preserve is the mtime — stamp it from the source so
+    // [`files_unchanged`] can skip this file on the next run.
     let bytes = std::fs::copy(src, dest)?;
-    if let Ok(meta) = std::fs::metadata(src) {
-        let _ = std::fs::set_permissions(dest, meta.permissions());
+    if let Ok(src_meta) = std::fs::metadata(src) {
+        if let Ok(mtime) = src_meta.modified() {
+            if let Ok(file) = std::fs::File::options().write(true).open(dest) {
+                let _ = file.set_modified(mtime);
+            }
+        }
     }
     Ok(bytes)
+}
+
+/// Quick-check whether `dest` already mirrors `src`: same entry kind and,
+/// for regular files, identical length and mtime (the mtime is stamped by
+/// [`copy_preserving`]). Mirrors rsync's default quick-check so unchanged
+/// files are skipped instead of rewritten on every backup.
+fn files_unchanged(src: &Path, dest: &Path) -> bool {
+    let (Ok(sm), Ok(dm)) = (
+        std::fs::symlink_metadata(src),
+        std::fs::symlink_metadata(dest),
+    ) else {
+        return false;
+    };
+    let sft = sm.file_type();
+    let dft = dm.file_type();
+    if sft.is_symlink() || dft.is_symlink() {
+        if !(sft.is_symlink() && dft.is_symlink()) {
+            return false;
+        }
+        return std::fs::read_link(src).ok() == std::fs::read_link(dest).ok();
+    }
+    if sft.is_file() && dft.is_file() {
+        return match (sm.modified(), dm.modified()) {
+            (Ok(a), Ok(b)) => sm.len() == dm.len() && a == b,
+            _ => false,
+        };
+    }
+    false
+}
+
+/// Record a credential-shaped exclusion during the sync walk so the caller
+/// can warn without a second traversal of the source tree. Only meaningful
+/// on the ToBackup direction; capped for reporting like `scan_secret_files`.
+fn record_secret_hit(
+    stats: &mut SyncStats,
+    filter: &ExclusionFilter,
+    rel: &Path,
+    direction: SyncDirection,
+) {
+    const MAX_SECRET_REPORT: usize = 50;
+    if direction != SyncDirection::ToBackup
+        || stats.secret_files.len() >= MAX_SECRET_REPORT
+        || !filter.is_secret_excluded(rel)
+    {
+        return;
+    }
+    // Location-relative path; the caller qualifies it with the location's
+    // backup_subdir before merging into the agent total.
+    stats.secret_files.push(rel.display().to_string());
+}
+
+/// Remove whatever sits at `path` — regular file, symlink, or directory
+/// tree — so a type-confused destination (file where a dir belongs, a
+/// dir where a file belongs, a symlink either way) never aborts a sync
+/// mid-operation. Same conflict policy as `remove_any` in export.rs.
+fn remove_conflicting(path: &Path) -> Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    if meta.is_dir() && !meta.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn sync_rsync(
@@ -581,16 +709,37 @@ fn sync_walkdir(
         }
         if filter.is_excluded(&rel) {
             stats.files_skipped += 1;
+            // Only regular files can be credential-shaped hits — same
+            // restriction scan_secret_files applies.
+            if entry.file_type().is_file() {
+                record_secret_hit(&mut stats, filter, &rel, direction);
+            }
             continue;
         }
-        if direction == SyncDirection::ToBackup && filter.exceeds_size_cap(entry.path()) {
-            stats.files_skipped += 1;
-            continue;
+        // Reuse the DirEntry's already-fetched metadata for the size cap
+        // instead of a fresh stat per file.
+        if direction == SyncDirection::ToBackup && filter.max_file_size().is_some() {
+            let exceeds = entry
+                .metadata()
+                .map(|m| filter.exceeds_size_cap_meta(&m))
+                .unwrap_or_else(|_| filter.exceeds_size_cap(entry.path()));
+            if exceeds {
+                stats.files_skipped += 1;
+                continue;
+            }
         }
         let dest_path = dest.join(&rel);
         kept.insert(rel.clone());
         if entry.file_type().is_dir() {
             if !dry_run {
+                // A file or symlink squatting at the destination path must
+                // go first — `create_dir_all` fails with EEXIST/ENOTDIR
+                // and would abort the whole sync mid-operation.
+                if let Ok(meta) = std::fs::symlink_metadata(&dest_path) {
+                    if !(meta.is_dir() && !meta.file_type().is_symlink()) {
+                        remove_conflicting(&dest_path)?;
+                    }
+                }
                 std::fs::create_dir_all(&dest_path)?;
                 // Preserve directory mode bits too (rsync -a parity).
                 if let Ok(meta) = entry.metadata() {
@@ -602,7 +751,10 @@ fn sync_walkdir(
             // directories contain "latest" pointers to files that have been
             // rotated away; without this the fallback silently dropped
             // them, and a restore to a fresh machine would not recreate
-            // them.
+            // them. An identical link at the destination is left alone.
+            if files_unchanged(entry.path(), &dest_path) {
+                continue;
+            }
             if dry_run {
                 stats.files_copied += 1;
                 stats.bytes_copied += entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -614,6 +766,12 @@ fn sync_walkdir(
             copy_symlink(entry.path(), &dest_path)?;
             stats.files_copied += 1;
         } else if entry.file_type().is_file() {
+            // Quick-check: identical size+mtime at the destination means
+            // the file was already synced — skip the rewrite (and don't
+            // count it in dry-run previews either).
+            if files_unchanged(entry.path(), &dest_path) {
+                continue;
+            }
             if dry_run {
                 stats.files_copied += 1;
                 stats.bytes_copied += entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -621,6 +779,14 @@ fn sync_walkdir(
             }
             if let Some(parent) = dest_path.parent() {
                 std::fs::create_dir_all(parent)?;
+            }
+            // A directory at dest must be replaced, not written through:
+            // `fs::copy` fails with EISDIR and `symlink()` fails EEXIST.
+            match std::fs::symlink_metadata(&dest_path) {
+                Ok(m) if m.is_dir() || m.file_type().is_symlink() => {
+                    remove_conflicting(&dest_path)?;
+                }
+                _ => {}
             }
             let bytes = copy_preserving(entry.path(), &dest_path)?;
             stats.files_copied += 1;
@@ -649,9 +815,9 @@ fn sync_walkdir(
 #[cfg(unix)]
 fn copy_symlink(src: &Path, dest: &Path) -> Result<()> {
     let target = std::fs::read_link(src)?;
-    if dest.symlink_metadata().is_ok() {
-        let _ = std::fs::remove_file(dest);
-    }
+    // `remove_conflicting`, not `remove_file`: a *directory* at dest made
+    // remove_file fail and symlink() then died with EEXIST.
+    remove_conflicting(dest)?;
     std::os::unix::fs::symlink(target, dest)?;
     Ok(())
 }
@@ -660,9 +826,7 @@ fn copy_symlink(src: &Path, dest: &Path) -> Result<()> {
 #[cfg(windows)]
 fn copy_symlink(src: &Path, dest: &Path) -> Result<()> {
     let target = std::fs::read_link(src)?;
-    if dest.symlink_metadata().is_ok() {
-        let _ = std::fs::remove_file(dest);
-    }
+    remove_conflicting(dest)?;
     let is_dir = std::fs::metadata(src).map(|m| m.is_dir()).unwrap_or(false);
     if is_dir {
         std::os::windows::fs::symlink_dir(target, dest)?;
@@ -675,7 +839,7 @@ fn copy_symlink(src: &Path, dest: &Path) -> Result<()> {
 /// Count files tracked by git for a specific agent subdirectory.
 /// This gives the accurate count after gitignore exclusions are applied.
 pub fn count_git_tracked(repo_path: &Path, agent_subdir: &str) -> Result<SyncStats> {
-    let out = std::process::Command::new("git")
+    let out = crate::git::git_command()
         .current_dir(repo_path)
         .args(["ls-files", agent_subdir])
         .output()?;
@@ -717,34 +881,65 @@ fn prune_unknown(
     kept: &std::collections::HashSet<PathBuf>,
     filter: &ExclusionFilter,
 ) -> Result<()> {
+    // The return value ("is `cur` empty now?") is only meaningful for
+    // callers that may remove the directory; the top-level call ignores it.
+    prune_dir(root, cur, kept, filter).map(|_| ())
+}
+
+/// Recursive worker for [`prune_unknown`]. Returns `Ok(true)` when `cur`
+/// holds no remaining entries after pruning, so the caller can drop the
+/// directory without a second `read_dir` emptiness probe. Relative paths
+/// are compared as `&Path` against `kept` — no per-entry `PathBuf` alloc.
+fn prune_dir(
+    root: &Path,
+    cur: &Path,
+    kept: &std::collections::HashSet<PathBuf>,
+    filter: &ExclusionFilter,
+) -> Result<bool> {
     if !cur.is_dir() {
-        return Ok(());
+        return Ok(true);
     }
+    let mut remaining = false;
     for entry in std::fs::read_dir(cur)? {
         let entry = entry?;
         let path = entry.path();
         let rel = match path.strip_prefix(root) {
-            Ok(r) => r.to_path_buf(),
+            Ok(r) => r,
             Err(_) => continue,
         };
-        if rel.as_os_str() == ".git" {
+        // Mirror the rsync `--exclude .git` / `--exclude .gitignore`
+        // rules: those names are protected at EVERY depth in BOTH
+        // directions. During restore `cur` is the live agent tree —
+        // deleting a live `.gitignore` or a nested `.git` (dir or
+        // gitfile) here is unrecoverable data loss.
+        let fname = entry.file_name();
+        if fname == ".git" || fname == ".gitignore" {
+            remaining = true;
             continue;
         }
-        if filter.is_excluded(&rel) {
+        if filter.is_excluded(rel) {
+            remaining = true;
             continue;
         }
         let ftype = entry.file_type()?;
         if ftype.is_dir() {
-            prune_unknown(root, &path, kept, filter)?;
-            // After pruning, remove if empty and not in kept.
-            if !kept.contains(&rel) && std::fs::read_dir(&path)?.next().is_none() {
-                std::fs::remove_dir(&path)?;
+            if prune_dir(root, &path, kept, filter)? {
+                // Child dir emptied out: drop it unless the sync kept it.
+                if kept.contains(rel) {
+                    remaining = true;
+                } else {
+                    std::fs::remove_dir(&path)?;
+                }
+            } else {
+                remaining = true;
             }
-        } else if !kept.contains(&rel) {
+        } else if kept.contains(rel) {
+            remaining = true;
+        } else {
             std::fs::remove_file(&path)?;
         }
     }
-    Ok(())
+    Ok(!remaining)
 }
 
 #[cfg(test)]

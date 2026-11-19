@@ -84,8 +84,9 @@ pub fn discover(registry: &Registry) -> Result<Vec<Discovered>> {
 }
 
 fn looks_like_agent_dir(path: &std::path::Path) -> bool {
-    // Heuristic: contains at least one of these tell-tale files.
-    let candidates = [
+    // Heuristic: contains at least one of these tell-tale entries.
+    // One directory read replaces up to 8 per-candidate stat calls.
+    const CANDIDATES: &[&str] = &[
         "config.json",
         "config.toml",
         "settings.json",
@@ -95,9 +96,14 @@ fn looks_like_agent_dir(path: &std::path::Path) -> bool {
         "sessions",
         "hooks.json",
     ];
-    for c in candidates {
-        if path.join(c).exists() {
-            return true;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            if CANDIDATES.contains(&name) {
+                return true;
+            }
         }
     }
     false
