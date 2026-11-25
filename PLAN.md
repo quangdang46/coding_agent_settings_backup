@@ -160,6 +160,7 @@ pub enum LocationType {
 | `zed` | Zed Editor (NEW) | `~/.zed/` (HomeDir) |
 | `roo` | Roo Code (NEW) | `~/.roo/` (HomeDir) |
 | `trae` | Trae (NEW) | `~/.trae/` (HomeDir) |
+| `devin` | Devin CLI (NEW) | `$XDG_CONFIG_HOME/devin/` (XdgConfig), `$XDG_DATA_HOME/devin/` (XdgData; `cli/` binaries and `mcp/oauth/` excluded) |
 
 ### Discovery System
 

@@ -170,7 +170,7 @@ expect_ok "init creates backup root"              "initialised"    casb init
 TOTAL=$((TOTAL+1))
 expect_ok "list shows custom agent"               "myagent"        casb list
 expect_ok "list shows claude (installed)"         "claude"         casb list
-expect_ok "list shows 19 built-in agents"         "codex"          casb list
+expect_ok "list shows 20 built-in agents"         "codex"          casb list
 
 # --- 3. config -----------------------------------------------------------
 section "Config subcommands"

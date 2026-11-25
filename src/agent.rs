@@ -1,8 +1,8 @@
 //! Agent definitions and multi-location resolution.
 //!
 //! Defines [`AgentConfig`] (the in-memory description of one AI coding
-//! agent), the 19 built-in agents from the `asb` reference plus
-//! Kiro/Continue/Copilot/Zed/Roo/Trae, and a [`Registry`] that merges
+//! agent), the 20 built-in agents from the `asb` reference plus
+//! Kiro/Continue/Copilot/Zed/Roo/Trae/Devin, and a [`Registry`] that merges
 //! built-ins with user-defined entries from [`crate::config::Config`].
 
 use crate::config::Config;
@@ -133,7 +133,7 @@ fn loc_file(path: PathBuf, ty: LocationType, sub: &str) -> AgentLocation {
     }
 }
 
-/// Build the list of 19 built-in agents.
+/// Build the list of 20 built-in agents.
 ///
 /// Multi-location agents (claude, opencode) carry several entries, each with
 /// a distinct `backup_subdir` so that a flat-merge into a single backup repo
@@ -344,6 +344,28 @@ pub fn builtin_agents() -> Result<Vec<AgentConfig>> {
             category: AgentCategory::Ide,
             locations: vec![loc_dir(home.join(".trae"), LocationType::HomeDir, ".trae")],
         },
+        // 20. Devin CLI (NEW)
+        //
+        // Devin CLI follows XDG: user config (config.json, mcp_config.json,
+        // skills/, AGENTS.md, hooks) lives in the config dir, while the data
+        // dir holds credentials.toml, persisted MCP OAuth tokens and the
+        // downloaded CLI itself under cli/_versions/ (hundreds of MB).
+        // The cli/ tree and mcp/oauth/ are excluded via agent_exclusions()
+        // in config.rs; credentials.toml is caught by the built-in secret
+        // patterns (`**/credentials.toml`).
+        AgentConfig {
+            key: "devin".into(),
+            display_name: "Devin CLI".into(),
+            category: AgentCategory::CliCoding,
+            locations: vec![
+                loc_dir(
+                    xdg_config.join("devin"),
+                    LocationType::XdgConfig,
+                    ".devin/config",
+                ),
+                loc_dir(xdg_data.join("devin"), LocationType::XdgData, ".devin/data"),
+            ],
+        },
     ];
 
     Ok(agents)
@@ -509,9 +531,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nineteen_builtin_agents_with_unique_keys() {
+    fn twenty_builtin_agents_with_unique_keys() {
         let agents = builtin_agents().unwrap();
-        assert_eq!(agents.len(), 19);
+        assert_eq!(agents.len(), 20);
         let mut keys: Vec<_> = agents.iter().map(|a| a.key.as_str()).collect();
         keys.sort();
         let mut deduped = keys.clone();
@@ -535,6 +557,18 @@ mod tests {
         let agents = builtin_agents().unwrap();
         let oc = agents.iter().find(|a| a.key == "opencode").unwrap();
         assert_eq!(oc.locations.len(), 2);
+    }
+
+    #[test]
+    fn devin_has_two_xdg_locations() {
+        let agents = builtin_agents().unwrap();
+        let devin = agents.iter().find(|a| a.key == "devin").unwrap();
+        assert_eq!(devin.locations.len(), 2);
+        assert!(devin
+            .locations
+            .iter()
+            .all(|l| matches!(l.kind, LocationKind::Directory)));
+        assert_eq!(devin.backup_root_subdir(), ".devin");
     }
 
     #[test]

@@ -13,8 +13,8 @@
 
 </div>
 
-**Back up, version, and restore configuration for 19 AI coding agents — in Rust.**  
-Claude Code, Codex, Cursor, Gemini, OpenCode, and 14 more. One shared git repo, `--json` for agents, full version history.
+**Back up, version, and restore configuration for 20 AI coding agents — in Rust.**  
+Claude Code, Codex, Cursor, Gemini, OpenCode, and 15 more. One shared git repo, `--json` for agents, full version history.
 
 <div align="center">
 
@@ -62,13 +62,13 @@ Manual backups are inconsistent. Per-agent `.git` folders sprawl. And when somet
 
 ### The Solution
 
-`casb` discovers every installed AI agent on your machine, backs up all their config directories into a **single shared git repository**, and gives you tags, history, diff, and restore — from one CLI. Nineteen agents supported out of the box, multi-location merging for agents with scattered config dirs, and SQLite state databases included.
+`casb` discovers every installed AI agent on your machine, backs up all their config directories into a **single shared git repository**, and gives you tags, history, diff, and restore — from one CLI. Twenty agents supported out of the box, multi-location merging for agents with scattered config dirs, and SQLite state databases included.
 
 ### Why casb?
 
 | Feature | What it does |
 |---------|--------------|
-| **19 agents, one repo** | Claude, Codex, Cursor, Gemini, OpenCode, Cline, Aider, Copilot, and 11 more — all under `~/.agent_settings_backups/.git` |
+| **20 agents, one repo** | Claude, Codex, Cursor, Gemini, OpenCode, Cline, Aider, Copilot, and 12 more — all under `~/.agent_settings_backups/.git` |
 | **Multi-location merge** | Agents with 2–3 config dirs get merged into a single backup commit |
 | **Machine-readable** | `--json` and `--format toon` for coding agents |
 | **Parallel backup** | `casb backup --parallel` runs agents concurrently |
@@ -83,7 +83,7 @@ Manual backups are inconsistent. Per-agent `.git` folders sprawl. And when somet
 
 | Capability | casb | Manual tar/cp | Per-agent git repos | Cloud sync (iCloud, rsync) |
 |-----------|------|--------------|---------------------|---------------------------|
-| **Agents auto-detected** | ✅ 19 built-in | ❌ Manual list | ❌ Per-agent setup | ❌ All-or-nothing |
+| **Agents auto-detected** | ✅ 20 built-in | ❌ Manual list | ❌ Per-agent setup | ❌ All-or-nothing |
 | **Shared git repo** | ✅ Single `.git` | ❌ Per-folder | ❌ Per-agent `.git` sprawl | ❌ Not versioned |
 | **Multi-location merge** | ✅ Claude=3 dirs merged | ❌ Manual merge | ❌ Split repos | ❌ Split folders |
 | **Diff per agent** | ✅ `casb diff` | ❌ Manual | ✅ Per-repo | ❌ |
@@ -100,7 +100,7 @@ Manual backups are inconsistent. Per-agent `.git` folders sprawl. And when somet
 casb init
 
 # Back up everything
-casb backup                    # all 19 agents
+casb backup                    # all 20 agents
 casb backup claude codex       # specific agents only
 casb backup --parallel         # concurrent
 
@@ -128,7 +128,7 @@ casb export claude - | ssh new-machine "casb import -"
 | Principle | Rationale |
 |-----------|-----------|
 | **One repo to rule them all** | A single shared git repository eliminates per-agent `.git` sprawl and makes cross-agent restores atomic |
-| **Auto-discovery over config** | Nineteen agents detected automatically; no manual `settings.json` |
+| **Auto-discovery over config** | Twenty agents detected automatically; no manual `settings.json` |
 | **Machine-readable first** | `--json` and `--format toon` so agents can inspect backup state without scraping |
 | **Safe by default** | `--dry-run`, `--force`, atomic writes, backup verification, pre/post hooks |
 | **No heavy dependencies** | `std::process::Command` for git — no `git2`/`libgit2`, ~2.9 MB binary |
@@ -172,9 +172,9 @@ cargo install --git https://github.com/quangdang46/coding_agent_settings_backup 
 | `doctor` | Health check diagnostics |
 | `completion <SHELL>` | Generate shell completion (bash/zsh/fish) |
 
-### Supported agents (19 built-in)
+### Supported agents (20 built-in)
 
-`claude` `codex` `cursor` `gemini` `cline` `amp` `aider` `opencode` `factory` `windsurf` `plandex` `qwencode` `amazonq` `kiro` `continue` `copilot` `zed` `roo` `trae`
+`claude` `codex` `cursor` `gemini` `cline` `amp` `aider` `opencode` `factory` `windsurf` `plandex` `qwencode` `amazonq` `kiro` `continue` `copilot` `zed` `roo` `trae` `devin`
 
 ---
 
@@ -248,7 +248,7 @@ built-in secret exclusions); the only opt-out for secrets is the global
 
 | Edge case | Reality |
 |-----------|---------|
-| **Agent coverage** | 19 built-in agents — not every CLI tool on earth. `discover` helps find custom ones |
+| **Agent coverage** | 20 built-in agents — not every CLI tool on earth. `discover` helps find custom ones |
 | **No cloud sync** | casb is local-first. Export/import for migration; no built-in push to S3/Backblaze |
 | **git required** | Relies on `git` in PATH. If git is absent, backup falls back to file copy (no versioning) |
 | **SQLite databases excluded** | `*.sqlite` / `*.db` are runtime state, not configuration — exclude them via `exclusions` if you want them |
@@ -267,7 +267,7 @@ Yes — `casb export agent - | ssh new "casb import -"`. The target machine does
 
 ### What if an agent has config in 3 directories?
 
-casb merges all locations into one backup commit per agent. Supported multi-location agents: Claude (3), OpenCode (2), Cline (2).
+casb merges all locations into one backup commit per agent. Supported multi-location agents: Claude (3), OpenCode (2), Devin (2).
 
 ### Does casb work without git?
 

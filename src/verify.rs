@@ -47,7 +47,7 @@ pub fn verify_agents(cfg: &Config, registry: &Registry, keys: &[String]) -> Resu
 
     // All agents share one repository, so the integrity check runs once and
     // the result is reported for every agent. Running `git fsck` once per
-    // agent meant the same repository was walked up to nineteen times.
+    // agent meant the same repository was walked once per agent.
     let repo = Repo::new(cfg.backup_root());
     let repo_exists = repo.exists();
     let shared_check = if repo_exists {

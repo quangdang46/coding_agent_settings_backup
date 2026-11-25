@@ -267,6 +267,12 @@ pub fn agent_exclusions(agent_key: &str) -> Vec<String> {
             "*.db-shm".into(),
             "*.db-wal".into(),
         ],
+        // Devin CLI: the XDG data dir's `cli/` subtree holds the downloaded
+        // CLI itself (`cli/_versions/`, hundreds of MB–GB), session DBs,
+        // logs, transcripts and summaries — all reinstallable runtime
+        // state. `mcp/oauth/` holds persisted MCP OAuth tokens whose
+        // filenames do not match the credential-shaped secret patterns.
+        "devin" => vec!["cli/".into(), "mcp/oauth/".into(), "**/mcp/oauth/".into()],
         _ => vec![],
     }
 }
